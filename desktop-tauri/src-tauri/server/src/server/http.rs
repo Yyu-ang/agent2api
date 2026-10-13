@@ -126,6 +126,14 @@ pub fn panel_router(state: ServerState) -> Router {
             "/api/session/login/kuku/complete",
             post(api::session::login_kuku_complete),
         )
+        // Tabbit 网页登录收尾：壳侧在用户于官方登录页完成登录后，从登录窗口
+        // 的 Cookie 存储读 `token`（HttpOnly，页面脚本读不到），把 state +
+        // Cookie 一并 POST 交到这里。**免鉴权**：调用方是壳侧进程（登录窗口），
+        // 不带 API Key；安全性由登录任务的一次性 state 承担（与 kuku 同款）。
+        .route(
+            "/api/session/login/tabbit/complete",
+            post(api::session::login_tabbit_complete),
+        )
         // AutoClaw OAuth（国际版）的 loopback 回调：**浏览器 302 到这里**
         // （授权页完成后顶层导航到我们交给上游的 navigate_uri，见
         // `providers::autoclaw::oauth`），所以同样必须免鉴权 —— 调用方是用户的

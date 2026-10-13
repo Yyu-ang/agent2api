@@ -142,6 +142,12 @@ pub mod qoder;
 pub mod raccoon;
 pub mod refresh_flight;
 pub mod router;
+/// Tabbit（浏览器 AI 助手）。适配实现在 `tabbit/`：账号管理（粘贴 Cookie /
+/// 网页登录）**加推理转发**（HMAC 签名 + 建会话 → SSE，`is_stateful()` 为 true，
+/// 会话是**请求内**的、不跨请求保持状态，与 KukuAI 同形态）。
+/// 国内版（`tabbit`）/ 国际版（`tabbit-intl`，`web.tabbit.ai`，国内直连 403）
+/// 是两家 provider、同一份实现按地区参数化（见 `tabbit::region`）。
+pub mod tabbit;
 /// Trae（字节 AI IDE）。适配实现在 `trae/`：登录 / 凭据 / 目录 / 会话式转发
 /// 已接通（只支持国内 SOLO 通道；国际版是另一套协议，将来另立 kind），见
 /// `trae/mod.rs` 的模块头。
@@ -454,6 +460,29 @@ pub enum ProviderKind {
     /// 不需要 CodeArts 那种会话闸门。凭据两层：网关 Basic（不过期，转发用）
     /// 与控制面临时 AK/SK（2 小时，额度/签到用）。
     OfficeAce,
+    /// Tabbit **国内版**（`tabbit`）。适配实现在 `tabbit/`：账号管理（粘贴
+    /// Cookie / 网页登录）**加推理转发**（HMAC 签名 + 建会话 → SSE，
+    /// `is_stateful()` 为 true，会话是请求内的）。
+    ///
+    /// ── 上游长什么样（tabbit2api 2026-10 实测，见 `tabbit/mod.rs` 的模块头）──
+    /// 认证是 `token`（HttpOnly JWT）Cookie；签名 key 由 `GET /chat/sign-key`
+    /// 动态获取（各域名独立）；对话 `POST /panel/session` 建会话 →
+    /// `POST /api/v1/chat/completion`（SSE）；`selected_model` 必须传目录里的
+    /// `display_name`；额度 `GET /api/commerce/quota/v1/usage`（上游真实值）。
+    ///
+    /// ── 与 [`ProviderKind::TabbitIntl`] 是同一套协议的两个地区 ────
+    /// 与 AutoClaw / Qoder / ZCode 的两地同一思路：地区是**provider 身份**
+    /// 而不是账号属性。两家共用**一份实现**：`tabbit::adapter::TabbitAdapter`
+    /// 持有一个 `tabbit::region::Region`，两个静态实例（`TABBIT_ADAPTER` /
+    /// `TABBIT_INTL_ADAPTER`）由 `adapter_for` 按 kind 给出。
+    /// 地区 → provider 的互查在 `tabbit::region::Region`（`kind` /
+    /// `provider_id` / `from_kind`），别处不要再写 `"tabbit-intl"` 这类字面量。
+    Tabbit,
+    /// Tabbit **国际版**（`tabbit-intl`，`web.tabbit.ai`）。与
+    /// [`ProviderKind::Tabbit`] 同一套协议、不同站点。**国内网络直连固定
+    /// 403**（地区限制）：账号未显式配代理时跟随系统代理
+    /// （`system_proxy_when_unset`，与 Antigravity 同一口径）。
+    TabbitIntl,
 }
 
 /// 一个提供商的静态元数据。
@@ -545,6 +574,10 @@ pub const PROVIDERS: &[ProviderMeta] = &[
     // glm-5.3 / deepseek-v4-flash-0731 / kimi-k2.6 …），注册表顺序决定目录
     // 合并时同名模型先归谁家 —— 放在末尾即「同名时优先已有各家」。
     ProviderMeta { id: "officeace", label: "OfficeAce 果办" },
+    // Tabbit 两个地区**相邻**排列（与 AutoClaw / Qoder / ZCode 同一理由）：
+    // 国内版在前。排在末尾（新家按约定追加在末尾，后到居后）。
+    ProviderMeta { id: "tabbit", label: "Tabbit 国内版" },
+    ProviderMeta { id: "tabbit-intl", label: "Tabbit 国际版" },
 ];
 
 /// provider id 在注册表里的下标（未知 id → None）。
@@ -628,6 +661,8 @@ pub fn kind_from_id(id: &str) -> Option<ProviderKind> {
         "commandcode" => Some(ProviderKind::CommandCode),
         "antigravity" => Some(ProviderKind::Antigravity),
         "officeace" => Some(ProviderKind::OfficeAce),
+        "tabbit" => Some(ProviderKind::Tabbit),
+        "tabbit-intl" => Some(ProviderKind::TabbitIntl),
         // 走到这里 = 上面的注册表判定已放行、这个 match 却没有对应分支：
         // 只可能是有人给 `PROVIDERS` 加了条目忘了加这里。开发期喊出来；
         // release 返回 None（见上：宁可为「未知」，不可误认成别家）。
@@ -669,6 +704,8 @@ pub const fn kind_id(kind: ProviderKind) -> &'static str {
         ProviderKind::CommandCode => "commandcode",
         ProviderKind::Antigravity => "antigravity",
         ProviderKind::OfficeAce => "officeace",
+        ProviderKind::Tabbit => "tabbit",
+        ProviderKind::TabbitIntl => "tabbit-intl",
     }
 }
 

@@ -175,6 +175,16 @@ pub(crate) fn refresh_meta(kind: ProviderKind) -> (bool, i64) {
             super::officeace::models::remote_refreshed(),
             super::officeace::models::last_refreshed_at(),
         ),
+        // Tabbit 两个地区各有一份独立清单（缓存按地区分格，见
+        // `tabbit::models` 的模块头）：这里如实各查**自己那一格**。
+        ProviderKind::Tabbit | ProviderKind::TabbitIntl => {
+            let region = super::tabbit::Region::from_kind(kind)
+                .unwrap_or(super::tabbit::Region::Cn);
+            (
+                super::tabbit::models::remote_refreshed(region),
+                super::tabbit::models::last_refreshed_at(region),
+            )
+        },
     }
 }
 

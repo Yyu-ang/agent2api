@@ -1120,6 +1120,10 @@ pub fn adapter_for(kind: ProviderKind) -> &'static dyn ProviderAdapter {
         // （Basic 网关凭据；账号管理走手工导入 / 自助 OAuth，见
         // `officeace/mod.rs` 的模块头）
         ProviderKind::OfficeAce => &super::officeace::adapter::OFFICEACE_ADAPTER,
+        // Tabbit 的两个地区是两个 provider、两个实例（同一份实现按地区参数化，
+        // 见 `tabbit::region::Region` 与 `tabbit::adapter` 的模块头）
+        ProviderKind::Tabbit => &super::tabbit::adapter::TABBIT_ADAPTER,
+        ProviderKind::TabbitIntl => &super::tabbit::adapter::TABBIT_INTL_ADAPTER,
     }
 }
 
@@ -1215,6 +1219,11 @@ pub fn implemented_kinds() -> Vec<ProviderKind> {
         // OfficeAce：远程目录（`GET {网关}/v1/models`）+ 有转发能力，
         // 进本列表才会被后台目录刷新调度
         ProviderKind::OfficeAce,
+        // Tabbit 的两个地区各算一家：适配器已接线（账号 / 目录 / 会话转发 /
+        // 余额 / 网页登录），且有远程目录（`GET /proxy/v1/model_config/models`）
+        // —— 必须在列表里，否则目录刷新循环不会问它。
+        ProviderKind::Tabbit,
+        ProviderKind::TabbitIntl,
     ]
 }
 

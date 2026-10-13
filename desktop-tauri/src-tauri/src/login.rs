@@ -1547,6 +1547,12 @@ async fn run_embedded(
     // 临时风控限流（同一凭证几分钟后即恢复，2026-10-07 实测对照），
     // 密集重试只会延长风控窗口。
     let mut kuku_retry_block_until: Option<tokio::time::Instant> = None;
+    // Tabbit 登录态只交回一次（判据是 Cookie 存储里出现 `token`，见等待循环
+    // 的 tabbit 分支与 `submit_tabbit_login`）。导航计数与 kuku 共用同一套
+    // 触发节拍（登录必然经过导航），单独记各自的 tick / last_nav。
+    let tabbit_submitted = Arc::new(AtomicBool::new(false));
+    let mut tabbit_check_tick: u32 = 0;
+    let mut tabbit_last_nav: u64 = 0;
 
     // 导航拦截与弹窗拦截**共用同一个标志**：两种入口收到的可能是同一个回调
     // （页面先改 location、再被 WebView2 派生出一条弹窗请求），分开各一个标志
@@ -1634,7 +1640,8 @@ async fn run_embedded(
             }
             // KukuAI 主站登录：每次导航（含跳 passport、登录后回跳主站）
             // 计数 +1，等待循环据此立即读一次 Cookie 存储做登录检测。
-            if provider == "kuku" {
+            // Tabbit 同理（登录必然经过导航：跳登录页、登录后回跳工作台）。
+            if provider == "kuku" || provider == "tabbit" || provider == "tabbit-intl" {
                 nav_counter_for_nav.fetch_add(1, Ordering::SeqCst);
             }
             host_allowed(url, provider, social_restore)
@@ -1785,6 +1792,42 @@ async fn run_embedded(
                 }
             }
         }
+        // Tabbit（国内版 web.tabbit.com / 国际版 web.tabbit.ai）：用户在内嵌
+        // 窗口里正常登录，壳侧以 **Cookie 存储里出现 `token`** 作为成功判据
+        // （`token` 是 JWT，上游鉴权凭据；读 cookie 走独立线程 + 超时，见
+        // `read_window_cookies`）。触发节拍与 kuku 同构：导航事件后立即读一次、
+        // 另每 4 拍（8 秒）兜底。`token` 不像 BDUSS 有影子 cookie 问题，发现即交回。
+        if provider == "tabbit" || provider == "tabbit-intl" {
+            tabbit_check_tick += 1;
+            let nav_count = nav_counter_for_check.load(Ordering::SeqCst);
+            let navigated = nav_count != tabbit_last_nav;
+            if navigated {
+                tabbit_last_nav = nav_count;
+            }
+            if !tabbit_submitted.load(Ordering::SeqCst)
+                && (navigated || tabbit_check_tick % 4 == 0)
+            {
+                match read_window_cookies(&window).await {
+                    Ok(cookies) => {
+                        let (header, has_token) = tabbit_cookie_header(&cookies);
+                        if has_token {
+                            tabbit_submitted.store(true, Ordering::SeqCst);
+                            if let Err(error) =
+                                submit_tabbit_login(&header, login_state).await
+                            {
+                                eprintln!(
+                                    "[login] 交回 Tabbit 登录态失败（下轮重试）: {error}"
+                                );
+                                tabbit_submitted.store(false, Ordering::SeqCst);
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        eprintln!("[login] Tabbit 读取窗口 Cookie 失败（下轮重试）: {error}");
+                    }
+                }
+            }
+        }
         match poll_once(login_state).await {
             PollOutcome::Pending => continue,
             // 任务载荷（`{account, warning…}`）随成功结果透传：前端据此
@@ -1930,6 +1973,47 @@ async fn submit_kuku_login(
         .await
         .map_err(|error| format!("网关收尾失败: {error}"))?;
     Ok(())
+}
+
+/// Tabbit 登录态交回：用户在内嵌窗口（web.tabbit.com / web.tabbit.ai）里登录
+/// 成功后，读 WebView2 的 Cookie 存储（含 HttpOnly），把 `token` 所在的
+/// Cookie 头 POST 网关收尾（`/api/session/login/tabbit/complete`，见
+/// `providers/tabbit/login.rs`）。`token` 是 JWT，上游一切鉴权都认它。
+async fn submit_tabbit_login(cookie_header: &str, login_state: &str) -> Result<(), String> {
+    let payload = json!({ "state": login_state, "cookie": cookie_header });
+    gateway::call("POST", "/api/session/login/tabbit/complete", Some(&payload))
+        .await
+        .map_err(|error| format!("网关收尾失败: {error}"))?;
+    Ok(())
+}
+
+/// 把窗口里的 Tabbit 域 Cookie 拼成 Cookie 头，返回 `(头串, 是否含 token)`。
+///
+/// 只收 `tabbit.com` / `tabbit.ai` 域（含子域）：`token` 以外的上游会话
+/// Cookie 也一并带上（上游可能校验完整会话），统计类跳过。
+fn tabbit_cookie_header(cookies: &[tauri::webview::Cookie<'static>]) -> (String, bool) {
+    let mut parts: Vec<String> = Vec::new();
+    let mut has_token = false;
+    let mut seen: Vec<String> = Vec::new();
+    for cookie in cookies {
+        let name = cookie.name().to_string();
+        let domain = cookie.domain().unwrap_or("").to_string();
+        if !(domain.ends_with("tabbit.com") || domain.ends_with("tabbit.ai")) {
+            continue;
+        }
+        if name.starts_with("Hm_")
+            || name == "HMACCOUNT"
+            || seen.iter().any(|existing| existing == &name)
+        {
+            continue;
+        }
+        if name == "token" {
+            has_token = true;
+        }
+        seen.push(name.clone());
+        parts.push(format!("{name}={}", cookie.value()));
+    }
+    (parts.join("; "), has_token)
 }
 
 /// 用系统默认浏览器打开链接。

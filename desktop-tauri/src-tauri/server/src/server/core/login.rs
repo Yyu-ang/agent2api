@@ -475,6 +475,68 @@ impl LoginService {
         Ok(account_id)
     }
 
+    /// Tabbit 网页登录收尾：校验任务 → 从登录态 Cookie 提取凭证 → 落账号。
+    ///
+    /// 与 KukuAI 同形态：官方登录页的跳转不携带授权码（凭证在 Tabbit 域的
+    /// Cookie 里，`token` 还是 HttpOnly），由壳侧登录窗口把 Cookie 直接 POST
+    /// 到 `POST /api/session/login/tabbit/complete`。地区由登录任务的
+    /// provider 决定（`tabbit` / `tabbit-intl`，发起时定的那一家）。
+    pub async fn finish_tabbit_login(
+        &self,
+        state: &str,
+        cookie: &str,
+    ) -> Result<String, GatewayError> {
+        use crate::server::core::providers::tabbit::Region;
+        let state = state.trim();
+        if state.is_empty() {
+            return Err(GatewayError::with_status(400, "缺少 state，无法确认这次回调归属"));
+        }
+        let Some(handle) = self.tasks.get(state) else {
+            return Err(GatewayError::with_status(
+                404,
+                "登录任务不存在或已过期，请重新发起网页登录",
+            ));
+        };
+        let task = handle.snapshot();
+        if task.canceled {
+            return Err(GatewayError::with_status(400, "登录已取消，请重新发起"));
+        }
+        if task.done {
+            // 幂等：同一个回调被送来两次不是错误
+            return Ok(String::new());
+        }
+        let region = match task.provider.as_str() {
+            "tabbit" => Region::Cn,
+            "tabbit-intl" => Region::Intl,
+            other => {
+                return Err(GatewayError::with_status(
+                    400,
+                    format!("该登录任务不属于 Tabbit（{other}），请重新发起"),
+                ));
+            }
+        };
+        let credentials =
+            crate::server::core::providers::tabbit::login::complete_login(region, cookie).await?;
+        let store = self.store.clone();
+        let account = store
+            .add_tabbit_account(&credentials, None, "web")
+            .map_err(|error| GatewayError::with_status(error.status_code, error.message))?;
+        let account_id = account
+            .get("id")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        let label = account
+            .get("name")
+            .and_then(Value::as_str)
+            .unwrap_or("Tabbit 账号")
+            .to_string();
+        let payload = json!({ "account": account, "edition": task.edition });
+        finish_task(&handle, &payload);
+        logging::log("[Login]", &format!("✅ Tabbit（{}）网页登录成功: {label}", region.label()));
+        Ok(account_id)
+    }
+
     /// 发起一次 **Cline 设备授权登录**（WorkOS RFC 8628）。
     ///
     /// ── 与前两条链路的区别（为什么是第三种形态）─────────────────

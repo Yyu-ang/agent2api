@@ -978,6 +978,41 @@ pub async fn login_kuku_complete(
     }
 }
 
+// ─── Tabbit 网页登录收尾 ───────────────────────────────────────
+
+/// `POST /api/session/login/tabbit/complete` —— 壳侧交回登录态。
+///
+/// Tabbit 官方登录页（Google / Apple 第三方登录）成功后**不携带授权码**
+/// （凭证在 Tabbit 域的 Cookie 里，`token` 是 HttpOnly，登录窗口的页面脚本
+/// `document.cookie` 读不到）—— 因此交回由**壳侧进程**完成：用户在登录窗口
+/// 完成登录后，壳从窗口的 Cookie 存储读出 `token`（含 HttpOnly），拼成
+/// Cookie 头 POST 到这里（`state` + `cookie` 在请求体里，不走 URL）。
+///
+/// 该路由**免鉴权**：调用方是壳侧进程（登录窗口），不带 API Key；安全性由
+/// 登录任务的一次性 state 承担（与 kuku 同款）。
+pub async fn login_tabbit_complete(
+    State(state): State<ServerState>,
+    Json(payload): Json<Value>,
+) -> Response {
+    let task_state = payload
+        .get("state")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .unwrap_or("");
+    let cookie = payload
+        .get("cookie")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .unwrap_or("");
+    if task_state.is_empty() || cookie.is_empty() {
+        return management_error(400, "登录失败：回调缺少 state 或登录态 Cookie，请重新发起网页登录。");
+    }
+    match state.login().finish_tabbit_login(task_state, cookie).await {
+        Ok(_) => ok_json(json!({ "ok": true })),
+        Err(error) => management_error(error.status_code, &format!("登录失败：{}", error.message)),
+    }
+}
+
 // ─── AutoClaw OAuth 网页登录（国际版，三段）──────────────────
 
 /// 从请求体里读 OAuth 变体（`vendor` 字段：`zai` / `google`）。
