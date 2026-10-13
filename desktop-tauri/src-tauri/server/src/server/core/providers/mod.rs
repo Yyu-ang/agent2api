@@ -142,6 +142,12 @@ pub mod qoder;
 pub mod raccoon;
 pub mod refresh_flight;
 pub mod router;
+/// TeleAgent（桌面 AI 助手）。适配实现在 `teleagent/`：签名鉴权
+/// （HMAC-SHA256，session key 取自本机 scheduler 进程环境）+ 模型目录
+/// （`GET /provider`）+ **会话转发**（建会话 → prompt_async → SSE 事件流），
+/// `is_stateful()` 为 true。无账号概念：零账号可转发（见 `teleagent/mod.rs`
+/// 的模块头）。
+pub mod teleagent;
 /// Trae（字节 AI IDE）。适配实现在 `trae/`：登录 / 凭据 / 目录 / 会话式转发
 /// 已接通（只支持国内 SOLO 通道；国际版是另一套协议，将来另立 kind），见
 /// `trae/mod.rs` 的模块头。
@@ -454,6 +460,14 @@ pub enum ProviderKind {
     /// 不需要 CodeArts 那种会话闸门。凭据两层：网关 Basic（不过期，转发用）
     /// 与控制面临时 AK/SK（2 小时，额度/签到用）。
     OfficeAce,
+    /// TeleAgent（桌面 AI 助手，`teleagent.cn`）。
+    ///
+    /// 上游是本机 `127.0.0.1:4397` 的 super-agent（TeleAgent 桌面应用），
+    /// 协议移植自 `lizhun781021/teleagent-openai-proxy`（MIT）：
+    /// HMAC-SHA256 签名（`local-v1`）+ 建会话 → `prompt_async` → SSE 事件流，
+    /// 模型 id 形如 `NewApi/chat-pro`。**无账号概念**：凭证是本机 scheduler
+    /// 进程环境里的 session key，零账号可转发（见 `teleagent/mod.rs`）。
+    TeleAgent,
 }
 
 /// 一个提供商的静态元数据。
@@ -545,6 +559,9 @@ pub const PROVIDERS: &[ProviderMeta] = &[
     // glm-5.3 / deepseek-v4-flash-0731 / kimi-k2.6 …），注册表顺序决定目录
     // 合并时同名模型先归谁家 —— 放在末尾即「同名时优先已有各家」。
     ProviderMeta { id: "officeace", label: "OfficeAce 果办" },
+    // TeleAgent：排末尾（新家按约定追加在末尾）。模型 id 是 `{providerID}/{modelID}`
+    // 形态（如 `NewApi/chat-pro`），带 `/` 前缀，与别家天然不撞。
+    ProviderMeta { id: "teleagent", label: "TeleAgent" },
 ];
 
 /// provider id 在注册表里的下标（未知 id → None）。
@@ -628,6 +645,7 @@ pub fn kind_from_id(id: &str) -> Option<ProviderKind> {
         "commandcode" => Some(ProviderKind::CommandCode),
         "antigravity" => Some(ProviderKind::Antigravity),
         "officeace" => Some(ProviderKind::OfficeAce),
+        "teleagent" => Some(ProviderKind::TeleAgent),
         // 走到这里 = 上面的注册表判定已放行、这个 match 却没有对应分支：
         // 只可能是有人给 `PROVIDERS` 加了条目忘了加这里。开发期喊出来；
         // release 返回 None（见上：宁可为「未知」，不可误认成别家）。
@@ -669,6 +687,7 @@ pub const fn kind_id(kind: ProviderKind) -> &'static str {
         ProviderKind::CommandCode => "commandcode",
         ProviderKind::Antigravity => "antigravity",
         ProviderKind::OfficeAce => "officeace",
+        ProviderKind::TeleAgent => "teleagent",
     }
 }
 
