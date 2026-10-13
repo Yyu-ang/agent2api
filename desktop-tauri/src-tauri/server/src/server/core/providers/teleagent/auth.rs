@@ -157,6 +157,21 @@ pub fn sign_headers(method: &str, path_with_query: &str) -> Result<Vec<(String, 
             "无法获取 SUPER_AGENT_LOCAL_SESSION_KEY，请确保 TeleAgent 桌面应用正在运行",
         )
     })?;
+    sign_headers_with_key(method, path_with_query, &key)
+}
+
+/// 用显式 key 生成签名头（核心实现；上者是「自动提取 key」的便捷包装）。
+///
+/// 添加账号时探活用户粘贴的 key、转发时用账号里存的 key 都走这里 ——
+/// 不读 key 缓存、不触发刷新：调用方拿到的 key 是哪一把，签的就是哪一把。
+pub fn sign_headers_with_key(
+    method: &str,
+    path_with_query: &str,
+    key: &str,
+) -> Result<Vec<(String, String)>, GatewayError> {
+    if key.trim().is_empty() {
+        return Err(GatewayError::with_status(400, "TeleAgent session key 为空，无法签名"));
+    }
     let timestamp = now_ms().to_string();
     let nonce = random_hex(24);
     // 待签串：5 段 `\n` 连接（与原实现 `"\\n".join([...])` 逐字同构）

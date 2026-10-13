@@ -23,7 +23,7 @@ use serde_json::{Value, json};
 use crate::server::core::egress;
 use crate::server::errors::GatewayError;
 
-use super::auth::{base_http_url, session_key, sign_headers};
+use super::auth::{base_http_url, session_key, sign_headers, sign_headers_with_key};
 
 /// 管理接口的默认超时（原实现 `sa_request` 默认 30 秒）
 const REQUEST_TIMEOUT_MS: u64 = 30_000;
@@ -173,6 +173,167 @@ pub async fn prompt_async(
             status as i32,
             format!("TeleAgent 发送消息失败（HTTP {status}，会话 {session_id}）"),
         ))
+    }
+}
+
+/// 一次带签名的请求（显式 key 版）：单次尝试，不重试。
+///
+/// 与 [`signed_request`] 的区别：key 由调用方给（账号里存的那一把），
+/// 不读 key 缓存；401/403 不触发「强制刷新 key 重试」—— 存下来的 key
+/// 没有可刷新的来源，重试没有意义，调用方直接按认证失败处理。
+async fn signed_request_with_key(
+    method: &str,
+    path: &str,
+    body: Option<&Value>,
+    timeout_ms: u64,
+    key: &str,
+) -> Result<(u16, String), GatewayError> {
+    let headers = sign_headers_with_key(method, path, key)?;
+    let url = format!("{}{path}", base_http_url());
+    // 直连本机回环：proxy 恒为 None（见 `mod.rs`「出网」）
+    let client = egress::client_for(None);
+    let mut builder = match method {
+        "POST" => client.post(&url),
+        _ => client.get(&url),
+    };
+    for (name, value) in &headers {
+        builder = builder.header(name.as_str(), value.as_str());
+    }
+    if let Some(payload) = body {
+        builder = builder
+            .header("Content-Type", "application/json")
+            .body(payload.to_string());
+    }
+    let response = builder
+        .timeout(std::time::Duration::from_millis(timeout_ms))
+        .send()
+        .await
+        .map_err(|error| {
+            if error.is_timeout() {
+                GatewayError::with_status(504, format!("TeleAgent 请求超时（{path}），请稍后重试"))
+            } else {
+                GatewayError::with_status(
+                    502,
+                    format!("TeleAgent 请求失败（{path}）：{}", egress::describe_error_detail(&error)),
+                )
+            }
+        })?;
+    let status = response.status().as_u16();
+    let text = response.text().await.unwrap_or_default();
+    Ok((status, text))
+}
+
+/// 一次带签名的 JSON 请求（显式 key 版），返回已解析的 body（2xx 才算成功）。
+async fn signed_json_with_key(
+    method: &str,
+    path: &str,
+    body: Option<&Value>,
+    timeout_ms: u64,
+    key: &str,
+) -> Result<Value, GatewayError> {
+    let (status, text) = signed_request_with_key(method, path, body, timeout_ms, key).await?;
+    if !(200..300).contains(&status) {
+        let head: String = text.chars().take(240).collect();
+        return Err(GatewayError::with_status(
+            status as i32,
+            format!("TeleAgent 返回 HTTP {status}（{path}）：{head}"),
+        ));
+    }
+    serde_json::from_str(&text).map_err(|_| {
+        GatewayError::with_status(502, format!("TeleAgent 返回非 JSON 响应（{path}）"))
+    })
+}
+
+/// 建会话（显式 key 版）：`POST /session` → 会话 id。
+pub async fn create_session_with_key(directory: &str, key: &str) -> Result<String, GatewayError> {
+    let mut body = json!({});
+    if !directory.is_empty() {
+        body["directory"] = json!(directory);
+    }
+    let value = signed_json_with_key("POST", "/session", Some(&body), REQUEST_TIMEOUT_MS, key).await?;
+    let id = value
+        .get("id")
+        .and_then(Value::as_str)
+        .or_else(|| value.get("data").and_then(|data| data.get("id")).and_then(Value::as_str))
+        .unwrap_or("")
+        .to_string();
+    if id.is_empty() {
+        return Err(GatewayError::with_status(
+            502,
+            "TeleAgent 建会话返回缺少 id（上游响应异常）",
+        ));
+    }
+    Ok(id)
+}
+
+/// 异步发消息（显式 key 版）：204/200 算成功。
+pub async fn prompt_async_with_key(
+    session_id: &str,
+    prompt_text: &str,
+    directory: &str,
+    provider_id: &str,
+    model_id: &str,
+    key: &str,
+) -> Result<(), GatewayError> {
+    let mut body = json!({
+        "sessionID": session_id,
+        "parts": [{"type": "text", "text": prompt_text}],
+    });
+    if !directory.is_empty() {
+        body["directory"] = json!(directory);
+    }
+    if !provider_id.is_empty() && !model_id.is_empty() {
+        body["model"] = json!({"providerID": provider_id, "modelID": model_id});
+    }
+    let path = format!("/session/{session_id}/prompt_async");
+    let (status, _) = signed_request_with_key("POST", &path, Some(&body), PROMPT_TIMEOUT_MS, key).await?;
+    if status == 200 || status == 204 {
+        Ok(())
+    } else if status == 401 || status == 403 {
+        Err(GatewayError::with_status(
+            401,
+            "TeleAgent 认证失败（存的 session key 已失效，请重新添加该账号）",
+        ))
+    } else {
+        Err(GatewayError::with_status(
+            status as i32,
+            format!("TeleAgent 发送消息失败（HTTP {status}，会话 {session_id}）"),
+        ))
+    }
+}
+
+/// 用显式 key 打一次上游探活（`GET /provider`，带签名）。
+///
+/// 添加账号时验证用户粘贴的 key 用：
+///   - 2xx → Ok（key 有效）；
+///   - 401/403 → 400「Session Key 无效」；
+///   - 连不上/超时 → 502「本机 super-agent 没在跑」。
+pub async fn probe_with_key(key: &str, timeout_ms: u64) -> Result<(), GatewayError> {
+    let (status, _) = signed_request_with_key("GET", "/provider", None, timeout_ms, key).await.map_err(|error| {
+        // 连接层面的失败转成更直白的文案：用户此刻最可能的情况是
+        // TeleAgent 桌面应用根本没在跑。
+        if error.status_code == 502 || error.status_code == 504 {
+            GatewayError::with_status(
+                502,
+                format!(
+                    "无法连接本机 TeleAgent 桌面应用（127.0.0.1:4397）：{}。请确保 TeleAgent 正在运行后再添加账号",
+                    error.message
+                ),
+            )
+        } else {
+            error
+        }
+    })?;
+    match status {
+        200..=299 => Ok(()),
+        401 | 403 => Err(GatewayError::with_status(
+            400,
+            "Session Key 无效：super-agent 拒绝了签名（401/403），请检查后重新粘贴",
+        )),
+        other => Err(GatewayError::with_status(
+            400,
+            format!("TeleAgent 探活失败：super-agent 返回 HTTP {other}"),
+        )),
     }
 }
 

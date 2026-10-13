@@ -760,6 +760,33 @@ function tabbitForm(spec: { provider: string; label: string; site: string; siteN
   }
 }
 
+/** TeleAgent provider id（与后端注册表一致，modal 里不再需要特判） */
+export const TELEAGENT_PROVIDER = 'teleagent'
+
+/**
+ * TeleAgent：凭证是 super-agent 的本地 session key
+ *（`SUPER_AGENT_LOCAL_SESSION_KEY`）。
+ *
+ * ── 两条来源 ──────────────────────────────────────────
+ * ① **从本机导入**：自动提取 scheduler 进程环境里的 key（需 TeleAgent
+ *    桌面应用正在运行；Unix 才有这条路，Windows 上提不到时改用②）。
+ * ② **粘贴 Session Key**：把 key 贴进来，添加时先对本机 super-agent
+ *    打一次探活（`GET /provider` 带签名），key 无效或 TeleAgent 没在跑
+ *    会直接报错，不会落下一条死账号。
+ */
+const TELEAGENT: ProviderConfig = {
+  provider: TELEAGENT_PROVIDER,
+  label: 'TeleAgent',
+  desktop: true,
+  desktopNote: t('从本机 TeleAgent 桌面应用自动提取 session key（需 TeleAgent 正在运行；Windows 上若提取不到请改用下方粘贴）。'),
+  manualTitle: t('粘贴 Session Key'),
+  manualNoteHtml: t('粘贴 TeleAgent super-agent 的 <code>SUPER_AGENT_LOCAL_SESSION_KEY</code>。网关用它给上游请求签名；添加时会先打一次上游探活，key 无效或本机 TeleAgent 没在跑会直接报错。'),
+  fields: [
+    { key: 'session_key', label: 'Session Key', rows: 3, placeholder: t('粘贴 SUPER_AGENT_LOCAL_SESSION_KEY') },
+    { key: 'name', label: t('备注名'), optional: true, placeholder: t('可选，留空则自动命名') },
+  ],
+}
+
 /** 内置家的表单块，顺序与旧 ADD_FORMS 一致（只影响 DOM 里的块顺序，不影响界面） */
 export const BUILTIN_CONFIGS: ProviderConfig[] = [
   RACCOON,
@@ -805,6 +832,9 @@ export const BUILTIN_CONFIGS: ProviderConfig[] = [
   // 国内版在前 —— 与后端注册表 PROVIDERS 的追加顺序一致（2026-10 接入）
   tabbitForm({ provider: 'tabbit', label: t('国内版'), site: 'web.tabbit.com', siteNote: t('国内版与国际版是**两套独立的账号**（同一产品的两个站点），token 不通用。') }),
   tabbitForm({ provider: 'tabbit-intl', label: t('国际版'), site: 'web.tabbit.ai', siteNote: t('国际版的站点是 web.tabbit.ai，与国内版不是同一站；国内直连国际版会被上游 403 拦截（地区限制），建议配好代理再添加。') }),
+  // TeleAgent：凭证是 super-agent 的本地 session key（手动粘贴 / 从本机导入），
+  // 排在末尾（与后端注册表 PROVIDERS 的排列一致，2026-10 接入）
+  TELEAGENT,
 ]
 
 /** WorkBuddy 的块 id（结构特殊，单独一个组件） */

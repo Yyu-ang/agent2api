@@ -37,7 +37,7 @@ use tokio_stream::wrappers::ReceiverStream;
 use crate::server::core::egress;
 use crate::server::errors::GatewayError;
 
-use super::auth::{base_http_url, sign_headers};
+use super::auth::{base_http_url, sign_headers, sign_headers_with_key};
 
 /// 事件流监听超时（原实现 `SSEListener` 默认 120 秒）
 const LISTEN_TIMEOUT_MS: u64 = 120_000;
@@ -356,6 +356,52 @@ pub async fn open_event_stream() -> Result<reqwest::Response, GatewayError> {
         }
     })?;
     let status = response.status().as_u16();
+    if !(200..300).contains(&status) {
+        return Err(GatewayError::with_status(
+            status as i32,
+            format!("TeleAgent 事件流返回 HTTP {status}"),
+        ));
+    }
+    Ok(response)
+}
+
+/// 打开 `/global/event` 的签名 SSE 连接（显式 key 版）。
+///
+/// 转发时用账号里存的 key 建连；key 无效时上游会直接拒绝建连（401/403），
+/// 调用方按认证失败处理（提示重新添加账号）。
+pub async fn open_event_stream_with_key(key: &str) -> Result<reqwest::Response, GatewayError> {
+    let path = "/global/event";
+    let headers = sign_headers_with_key("GET", path, key)?;
+    let url = format!("{}{path}", base_http_url());
+    // 直连本机回环（见 `mod.rs`「出网」）
+    let client = egress::client_for(None);
+    let mut builder = client
+        .get(&url)
+        .header("Accept", "text/event-stream")
+        .timeout(std::time::Duration::from_millis(LISTEN_TIMEOUT_MS));
+    for (name, value) in &headers {
+        builder = builder.header(name.as_str(), value.as_str());
+    }
+    let response = builder.send().await.map_err(|error| {
+        if error.is_timeout() {
+            GatewayError::with_status(504, "TeleAgent 事件流连接超时，请稍后重试")
+        } else {
+            GatewayError::with_status(
+                502,
+                format!(
+                    "TeleAgent 事件流连接失败：{}",
+                    egress::describe_error_detail(&error)
+                ),
+            )
+        }
+    })?;
+    let status = response.status().as_u16();
+    if status == 401 || status == 403 {
+        return Err(GatewayError::with_status(
+            401,
+            "TeleAgent 认证失败（存的 session key 已失效，请重新添加该账号）",
+        ));
+    }
     if !(200..300).contains(&status) {
         return Err(GatewayError::with_status(
             status as i32,

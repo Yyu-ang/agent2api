@@ -663,7 +663,7 @@ fn allowed_hosts(provider: &str) -> Option<&'static [&'static str]> {
         // 会拿到 WorkBuddy 的白名单 → 窗口白屏）。
         "catpaw" | "qoder" | "qoder-intl" | "cline-free" | "cline-pass" | "autoclaw"
         | "autoclaw-intl" | "accio" | "accio-cn" | "zcode" | "zcode-intl" | "codearts" | "trae"
-        | "kuku" | "antigravity" | "officeace" => None,
+        | "kuku" | "antigravity" | "officeace" | "tabbit" | "tabbit-intl" => None,
         // WorkBuddy 的两个地区共用这一张表（表里 `workbuddy.ai` 那一行就是国际站
         // 的登录域）。**显式列出**而不是靠下面的默认分支：上面那条警告要求
         // 「新 provider 落到默认分支」必须是有意的选择，写出来才看得出是选过的
@@ -871,6 +871,11 @@ fn normalize_provider(provider: &str) -> Result<&'static str, String> {
         // 与轮询 —— 与 ZCode / CodeArts 同一条路。它的授权码由网关**轮询云端**
         // 取回（云端回调页不往本机跳），所以窗口最后停在云端页上也不影响登录判定。
         "officeace" => Ok("officeace"),
+        // Tabbit 两个地区：授权地址由**后端适配器**拼（官方登录页），壳侧负责
+        // 开窗口、读 `token` Cookie 交回网关（见 `submit_tabbit_login`）。
+        // 漏了这一条前端点「网页登录」会直接报「不支持网页登录的提供商」。
+        "tabbit" => Ok("tabbit"),
+        "tabbit-intl" => Ok("tabbit-intl"),
         other => Err(format!("不支持网页登录的提供商：{other}")),
     }
 }

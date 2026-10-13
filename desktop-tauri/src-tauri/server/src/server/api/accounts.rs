@@ -770,15 +770,32 @@ pub async fn add_account(state: &ServerState, body: &Bytes) -> Response {
             // 面板传来的名字是用户自己打的 ⇒ 标 custom（此后续期/重登不改它）
             store.add_officeace_account(&payload, import_name, true)
         }
-        // TeleAgent：**无账号概念**（凭证是本机 scheduler 进程环境里的
-        // session key，网关自动提取，见 `teleagent/auth.rs`）—— 不需要、
-        // 也不支持手动添加账号。给一个明确的 400，而不是让它落进下面
-        // WorkBuddy 的通用落账号路径（那会产生一条无意义的账号记录）。
+        // TeleAgent：凭证是 super-agent 的本地 session key。
+        // `importDesktop: true` → 从本机 scheduler 进程环境自动提取
+        // （需 TeleAgent 正在运行，Unix 才有这条路）；
+        // 手动粘贴（`session_key`）→ 先对本机 super-agent 探活，key 有效才落盘。
+        // 提取到的登录态也落成账号记录：账号页要展示、用量要记账（见
+        // `teleagent_accounts.rs` 模块头）。
         Some(crate::server::core::providers::ProviderKind::TeleAgent) => {
-            return management_error(
-                400,
-                "TeleAgent 不需要添加账号：网关自动从本机 TeleAgent 桌面应用提取登录态（请确保 TeleAgent 正在运行）",
-            );
+            if import_desktop {
+                store.import_teleagent_desktop_account("manual")
+            } else {
+                let key =
+                    crate::server::core::account_store::teleagent_accounts::pasted_key(&payload);
+                if key.is_empty() {
+                    return management_error(
+                        400,
+                        "请粘贴 TeleAgent 的 Session Key（SUPER_AGENT_LOCAL_SESSION_KEY）",
+                    );
+                }
+                if let Err(error) =
+                    crate::server::core::providers::teleagent::protocol::probe_with_key(&key, 8000)
+                        .await
+                {
+                    return management_error(error.status_code, error.message);
+                }
+                store.add_teleagent_account(&key, import_name, "manual")
+            }
         }
         // Tabbit（浏览器 AI 助手，两个地区）：**粘贴 Cookie**（Cookie 头串 /
         // Cookie 编辑器 JSON / `{token, user_id}` 对象，见

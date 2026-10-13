@@ -97,7 +97,7 @@ pub fn last_refreshed_at() -> i64 {
 
 /// 刷新远程目录（`force = true` 跳过 TTL；失败不返回错误，保留现有清单）。
 ///
-/// TeleAgent 没有账号概念：`store` / `account_id` 忽略（签名 key 即凭证，
+/// 模型目录是全局的：`store` / `account_id` 忽略（签名 key 即凭证，
 /// 见 `auth.rs`）。`refresh_uses_account() = false` 与之配对。
 pub async fn refresh(
     _store: &crate::server::core::account_store::AccountStore,

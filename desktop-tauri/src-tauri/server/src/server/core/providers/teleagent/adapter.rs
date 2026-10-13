@@ -14,13 +14,15 @@
 //! KukuAI / CatPaw 相同）。会话是**请求内**的（新建即用、用毕即弃），
 //! 因此没有会话注册表 / 轮次状态机。
 //!
-//! ── 凭证：无账号，session key 即凭证 ─────────────────────────
-//!   - `ensure_access_token`：返回 `auth::session_key()`（60 秒缓存）；
-//!     取不到 → 503「请确保 TeleAgent 桌面应用正在运行」；
-//!   - `refresh_access_token`：**强制**重取（跳过缓存）—— 对应原实现
-//!     `sa_request` 里 401/403 后 `_force_refresh_session_key()` 的语义；
+//! ── 凭证：session key（账号里存的 / 自动提取的） ─────────────
+//!   - `ensure_access_token`：有账号 → 账号里存的 key；无账号 →
+//!     `auth::session_key()`（60 秒缓存）；取不到 → 503「请确保 TeleAgent
+//!     桌面应用正在运行」；
+//!   - `refresh_access_token`：有账号 → 存的 key 无刷新来源，直接 401
+//!     （提示重新添加）；无账号 → **强制**重取（跳过缓存，对应原实现
+//!     `sa_request` 里 401/403 后 `_force_refresh_session_key()` 的语义）；
 //!   - `allows_anonymous_default_session() = true`：零账号可转发
-//!     （TeleAgent 没有账号概念）；
+//!     （本机 key 就是默认登录态）；
 //!   - `env_credentials_present()`：此刻能否取到 key —— 决定 `/v1/models`
 //!     广告不广告 TeleAgent 的模型（`catalog::provider_available` 的口径）；
 //!   - `supports_refresh` 保持默认 false：key 走 60 秒缓存 + 401 懒刷新，
@@ -123,7 +125,7 @@ impl ProviderAdapter for TeleAgentAdapter {
 
     /// 拉取远程模型目录（`GET /provider`，见 `models.rs`）。
     ///
-    /// TeleAgent 无账号概念：`store` / `account_id` 忽略（签名 key 即凭证）。
+    /// 模型目录是全局的（不按账号分）：`store` / `account_id` 忽略。
     /// 没有可用登录态（TeleAgent 没跑）时返回 `unchanged()`（不是错误）。
     /// `force` 一路透传：`false` 走 TTL 早退（自动路径），`true` 真打上游
     /// （用户手动点了「刷新模型清单」）。
@@ -143,44 +145,50 @@ impl ProviderAdapter for TeleAgentAdapter {
         true
     }
 
-    /// 模型目录刷新不走「账号」维度（无账号概念，`models::refresh` 忽略
-    /// `account_id`）——「获取模型」弹窗不显示无意义的账号下拉
+    /// 模型目录刷新不走「账号」维度（`models::refresh` 忽略 `account_id`）
+    /// ——「获取模型」弹窗不显示无意义的账号下拉
     /// （与 [`Self::refresh_models`] 的参数配对，见 trait 文档）。
     fn refresh_uses_account(&self) -> bool {
         false
     }
 
-    /// 凭证：session key（`auth::session_key`，60 秒缓存）。
+    /// 凭证：session key。
     ///
-    /// TeleAgent 没有账号：`account_id` 忽略，永远取本机 key。
-    /// 取不到 → 503，文案告诉用户去启动 TeleAgent 桌面应用。
+    /// 有账号（`account_id` 非空）→ 用账号里存的那一把 key（添加时已探活）；
+    /// 无账号 → 自动提取本机 key（匿名直转兜底，见
+    /// `allows_anonymous_default_session`）。
     fn ensure_access_token<'a>(
         &'a self,
-        _store: &'a AccountStore,
-        _account_id: &'a str,
+        store: &'a AccountStore,
+        account_id: &'a str,
     ) -> std::pin::Pin<
         Box<dyn std::future::Future<Output = Result<String, GatewayError>> + Send + 'a>,
     > {
         Box::pin(async move {
-            auth::session_key(false).ok_or_else(|| {
-                GatewayError::with_status(
-                    503,
-                    "无法获取 SUPER_AGENT_LOCAL_SESSION_KEY，请确保 TeleAgent 桌面应用正在运行",
-                )
-            })
+            crate::server::core::account_store::teleagent_accounts::session_key_for(
+                store, account_id,
+            )
         })
     }
 
-    /// 401 后的**强制**刷新：跳过 60 秒缓存，真取一次（对应原实现
-    /// `_force_refresh_session_key()` 的语义）。
+    /// 401 后的**强制**刷新。
+    ///
+    /// 有账号 → 存的 key 没有可刷新的来源，直接按认证失败处理（提示重新添加）；
+    /// 无账号 → 跳过 60 秒缓存真取一次（对应原实现 `_force_refresh_session_key()`）。
     fn refresh_access_token<'a>(
         &'a self,
         _store: &'a AccountStore,
-        _account_id: &'a str,
+        account_id: &'a str,
     ) -> std::pin::Pin<
         Box<dyn std::future::Future<Output = Result<String, GatewayError>> + Send + 'a>,
     > {
         Box::pin(async move {
+            if !account_id.trim().is_empty() {
+                return Err(GatewayError::with_status(
+                    401,
+                    "TeleAgent 认证失败（存的 session key 已失效，请重新添加该账号）",
+                ));
+            }
             auth::session_key(true).ok_or_else(|| {
                 GatewayError::with_status(
                     401,
@@ -190,7 +198,7 @@ impl ProviderAdapter for TeleAgentAdapter {
         })
     }
 
-    /// 零账号可转发：TeleAgent 没有账号概念，本机 key 就是默认登录态。
+    /// 零账号可转发：本机 key 就是默认登录态。
     ///
     /// 编排层据此在「没有任何账号记录」时放行（否则直接 503
     /// 「请在账号页添加并启用账号」）。

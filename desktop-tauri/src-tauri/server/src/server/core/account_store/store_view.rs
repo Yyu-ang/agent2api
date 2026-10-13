@@ -310,6 +310,10 @@ impl AccountStore {
             // 字段两地完全一致（uid / loginName / tokenTail），差别只在站点域名
             // （那是转发与凭证层的事）
             self.to_tabbit_public_account(record)
+        } else if record.provider() == super::teleagent_accounts::TELEAGENT_PROVIDER_ID {
+            // TeleAgent：只透出标识与 key 尾号（key 本体不出这个函数）。
+            // 漏这一支会掉进 workbuddy 兜底形状，界面多出一批与它无关的空字段。
+            self.to_teleagent_public_account(record)
         } else if record
             .provider()
             .starts_with(crate::server::core::custom_providers::ID_PREFIX)

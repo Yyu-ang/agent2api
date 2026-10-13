@@ -35,28 +35,28 @@ use crate::server::core::upstream::usage::RequestTelemetry;
 use crate::server::core::upstream::ForwardOutcome;
 use crate::server::errors::GatewayError;
 
-use super::auth::session_key;
 use super::{models, protocol, stream, teleagent_id};
 
 /// 转发入口（有状态路径 `forward_conversation` 转调）。
 ///
-/// `account_id` / `store`：TeleAgent 无账号概念，忽略（凭证即 session key，
-/// 见 `auth.rs`）；`proxy`：忽略，永远直连本机回环（见 `mod.rs`「出网」）。
+/// 凭证：先定 key —— 有账号用账号里存的，无账号自动提取本机 key
+/// （见 `teleagent_accounts::session_key_for`）；之后建会话、发消息、
+/// 开事件流**全部用同一把 key 签名**，不混用。
+///
+/// `proxy`：忽略，永远直连本机回环（见 `mod.rs`「出网」）。
 pub async fn run_chat(
-    _store: &AccountStore,
-    _account_id: &str,
+    store: &AccountStore,
+    account_id: &str,
     body: &Value,
     _proxy: Option<ResolvedProxy>,
     stream: bool,
     telemetry: &Arc<RequestTelemetry>,
 ) -> Result<ForwardOutcome, GatewayError> {
-    // 快速失败：TeleAgent 没跑时 key 取不到，后面全是无用功
-    if session_key(false).is_none() {
-        return Err(GatewayError::with_status(
-            503,
-            "无法获取 SUPER_AGENT_LOCAL_SESSION_KEY，请确保 TeleAgent 桌面应用正在运行",
-        ));
-    }
+    // 先定 key：账号指定的用账号的，否则自动提取。取不到直接失败，
+    // 后面全是无用功（之前这里只认自动提取，手动粘贴的 key 用不上）。
+    let key = crate::server::core::account_store::teleagent_accounts::session_key_for(
+        store, account_id,
+    )?;
     let client_model = body
         .get("model")
         .and_then(Value::as_str)
@@ -73,9 +73,10 @@ pub async fn run_chat(
     let directory = protocol::default_directory();
 
     // 先开事件流（见模块头「有意差异」），再建会话、再投递
-    let event_stream = stream::open_event_stream().await?;
-    let session_id = protocol::create_session(&directory).await?;
-    protocol::prompt_async(&session_id, &prompt, &directory, &provider_id, &model_id).await?;
+    let event_stream = stream::open_event_stream_with_key(&key).await?;
+    let session_id = protocol::create_session_with_key(&directory, &key).await?;
+    protocol::prompt_async_with_key(&session_id, &prompt, &directory, &provider_id, &model_id, &key)
+        .await?;
 
     if let Some(capture) = telemetry.capture().as_deref() {
         let url = format!(
