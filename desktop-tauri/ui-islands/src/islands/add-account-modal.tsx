@@ -58,6 +58,9 @@ import { t } from '../i18n'
 
 type Step = 'pick' | 'form'
 
+/** TeleAgent 的 provider id（无账号概念，表单区给专属说明块，见下方） */
+const TELEAGENT_PROVIDER = 'teleagent'
+
 type IslandState = {
   step: Step
   accountType: AccountType
@@ -144,7 +147,9 @@ function AddAccountModal({
 
   const config = configOf(state.provider)
   const isCustom = state.provider === CUSTOM_PROVIDER
-  const hasBlock = state.provider === WORKBUDDY_PROVIDER || isCustom || Boolean(config)
+  // TeleAgent 无账号概念（见下方表单区的说明块）：有专属说明，不落进「即将上线」
+  const isTeleAgent = state.provider === TELEAGENT_PROVIDER
+  const hasBlock = state.provider === WORKBUDDY_PROVIDER || isCustom || isTeleAgent || Boolean(config)
   const customMode: CustomMode = state.providerHint ? 'existing' : 'create'
   const customLabel = state.providerHint
     ? customList().find(item => item.id === state.providerHint)?.name || ''
@@ -277,6 +282,17 @@ function AddAccountModal({
                   </DialogSection>
                 </div>
               )}
+              {/* TeleAgent 无账号概念：凭证是本机 scheduler 进程环境里的 session key，
+                  网关自动提取、零配置转发 —— 这里不需要也不支持手动添加账号，
+                  给一段说明而不是落进上面的「即将上线」。 */}
+              {state.provider === TELEAGENT_PROVIDER ? (
+                <div className='add-provider-block'>
+                  <DialogSection>
+                    <h3>{t('TeleAgent 无需添加账号')}</h3>
+                    <p>{t('网关自动从本机 TeleAgent 桌面应用提取登录态（session key），零配置即可转发。请确保 TeleAgent 桌面应用正在运行；Windows 上若提取不到，可手动设置环境变量 SUPER_AGENT_LOCAL_SESSION_KEY 后重启网关。')}</p>
+                  </DialogSection>
+                </div>
+              ) : null}
             </DialogBody>
             {/* 表单弹窗这条操作条归自定义块（它把自己的主按钮搬进来）；内置家的主按钮
                 仍在各自段落里，因此只有自定义块在场时才渲染这条 */}
