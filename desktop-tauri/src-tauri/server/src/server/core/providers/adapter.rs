@@ -1143,6 +1143,10 @@ pub fn adapter_for(kind: ProviderKind) -> &'static dyn ProviderAdapter {
         // （Basic 网关凭据；账号管理走手工导入 / 自助 OAuth，见
         // `officeace/mod.rs` 的模块头）
         ProviderKind::OfficeAce => &super::officeace::adapter::OFFICEACE_ADAPTER,
+        // TeleAgent（桌面 AI 助手）：会话式转发（建会话 → prompt_async →
+        // SSE 事件流，`is_stateful` 为 true，无账号概念，见 `teleagent/mod.rs`
+        // 的模块头）
+        ProviderKind::TeleAgent => &super::teleagent::TELEAGENT_ADAPTER,
     }
 }
 
@@ -1238,6 +1242,10 @@ pub fn implemented_kinds() -> Vec<ProviderKind> {
         // OfficeAce：远程目录（`GET {网关}/v1/models`）+ 有转发能力，
         // 进本列表才会被后台目录刷新调度
         ProviderKind::OfficeAce,
+        // TeleAgent：远程目录（`GET 127.0.0.1:4397/provider`，只收
+        // `source == "config"` 的已配置 provider）+ 会话式转发能力，
+        // 进本列表才会被后台目录刷新调度。无账号概念：刷新不走账号维度。
+        ProviderKind::TeleAgent,
     ]
 }
 

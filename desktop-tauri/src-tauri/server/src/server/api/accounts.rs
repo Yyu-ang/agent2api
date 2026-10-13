@@ -770,6 +770,16 @@ pub async fn add_account(state: &ServerState, body: &Bytes) -> Response {
             // 面板传来的名字是用户自己打的 ⇒ 标 custom（此后续期/重登不改它）
             store.add_officeace_account(&payload, import_name, true)
         }
+        // TeleAgent：**无账号概念**（凭证是本机 scheduler 进程环境里的
+        // session key，网关自动提取，见 `teleagent/auth.rs`）—— 不需要、
+        // 也不支持手动添加账号。给一个明确的 400，而不是让它落进下面
+        // WorkBuddy 的通用落账号路径（那会产生一条无意义的账号记录）。
+        Some(crate::server::core::providers::ProviderKind::TeleAgent) => {
+            return management_error(
+                400,
+                "TeleAgent 不需要添加账号：网关自动从本机 TeleAgent 桌面应用提取登录态（请确保 TeleAgent 正在运行）",
+            );
+        }
         // WorkBuddy 系的两家（国内版 / 国际版）：同一套凭证形态与落账号路径，
         // 差别只有归属 —— provider id 自己就是归属（拆家后不再从 payload 里的
         // `edition` 反推：那是账号的属性，而落哪一家是身份问题）。

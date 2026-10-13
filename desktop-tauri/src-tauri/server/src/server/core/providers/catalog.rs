@@ -175,6 +175,12 @@ pub(crate) fn refresh_meta(kind: ProviderKind) -> (bool, i64) {
             super::officeace::models::remote_refreshed(),
             super::officeace::models::last_refreshed_at(),
         ),
+        // TeleAgent 的清单来自本机 super-agent 的 `GET /provider`
+        //（只收 `source == "config"` 的已配置 provider，见 `teleagent/models.rs`）。
+        ProviderKind::TeleAgent => (
+            super::teleagent::models::remote_refreshed(),
+            super::teleagent::models::last_refreshed_at(),
+        ),
     }
 }
 
