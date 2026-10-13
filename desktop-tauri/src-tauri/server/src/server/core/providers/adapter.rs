@@ -1147,6 +1147,10 @@ pub fn adapter_for(kind: ProviderKind) -> &'static dyn ProviderAdapter {
         // SSE 事件流，`is_stateful` 为 true，无账号概念，见 `teleagent/mod.rs`
         // 的模块头）
         ProviderKind::TeleAgent => &super::teleagent::TELEAGENT_ADAPTER,
+        // Tabbit 的两个地区是两个 provider、两个实例（同一份实现按地区参数化，
+        // 见 `tabbit::region::Region` 与 `tabbit::adapter` 的模块头）
+        ProviderKind::Tabbit => &super::tabbit::adapter::TABBIT_ADAPTER,
+        ProviderKind::TabbitIntl => &super::tabbit::adapter::TABBIT_INTL_ADAPTER,
     }
 }
 
@@ -1246,6 +1250,11 @@ pub fn implemented_kinds() -> Vec<ProviderKind> {
         // `source == "config"` 的已配置 provider）+ 会话式转发能力，
         // 进本列表才会被后台目录刷新调度。无账号概念：刷新不走账号维度。
         ProviderKind::TeleAgent,
+        // Tabbit 的两个地区各算一家：适配器已接线（账号 / 目录 / 会话转发 /
+        // 余额 / 网页登录），且有远程目录（`GET /proxy/v1/model_config/models`）
+        // —— 必须在列表里，否则目录刷新循环不会问它。
+        ProviderKind::Tabbit,
+        ProviderKind::TabbitIntl,
     ]
 }
 

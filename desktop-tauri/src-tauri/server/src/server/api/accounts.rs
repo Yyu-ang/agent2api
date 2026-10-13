@@ -780,6 +780,55 @@ pub async fn add_account(state: &ServerState, body: &Bytes) -> Response {
                 "TeleAgent 不需要添加账号：网关自动从本机 TeleAgent 桌面应用提取登录态（请确保 TeleAgent 正在运行）",
             );
         }
+        // Tabbit（浏览器 AI 助手，两个地区）：**粘贴 Cookie**（Cookie 头串 /
+        // Cookie 编辑器 JSON / `{token, user_id}` 对象，见
+        // `tabbit::credentials::credentials_from_paste`）→ 用上游 `base-info`
+        // 验证并补身份 → 落账号。地区由 provider id 决定（权威）；粘贴串里若
+        // 带可识别的登录域名，按域名自动归位（解析函数内处理）。
+        // 「网页登录」是另一条链路（`api::session::login_start` 的通用网页登录
+        // → 壳侧读 `token` Cookie → `/api/session/login/tabbit/complete`
+        // → 同一个落账号入口 `add_tabbit_account`）。
+        //
+        // `importDesktop` 不提供：Tabbit 没有桌面客户端（它是浏览器），登录态
+        // 在浏览器 Cookie 里 —— 给了入口只会稳定失败。
+        Some(kind @ (crate::server::core::providers::ProviderKind::Tabbit
+            | crate::server::core::providers::ProviderKind::TabbitIntl)) => {
+            if import_desktop {
+                return management_error(
+                    400,
+                    "Tabbit 没有桌面客户端，请粘贴 Cookie 或使用「网页登录」添加账号",
+                );
+            }
+            let region = crate::server::core::providers::tabbit::Region::from_kind(kind)
+                .unwrap_or(crate::server::core::providers::tabbit::Region::Cn);
+            let raw = payload
+                .get("cookie")
+                .or_else(|| payload.get("token"))
+                .or_else(|| payload.get("cookieText"))
+                .or_else(|| payload.get("text"))
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .trim();
+            let parsed = match crate::server::core::providers::tabbit::credentials::credentials_from_paste(
+                raw, region,
+            ) {
+                Ok(credentials) => credentials,
+                Err(reason) => return management_error(400, reason),
+            };
+            let verified =
+                match crate::server::core::providers::tabbit::credentials::enrich_identity(
+                    &parsed, None,
+                )
+                .await
+                {
+                    Ok(credentials) => credentials,
+                    Err(error) => return management_error(error.status_code, error.message),
+                };
+            // 粘贴串里若带了另一地区的域名，解析函数已按域名归位：
+            // 落账号用凭证实际的地区（与用户点的那一家不一致时，以域名为准，
+            // 参考实现的「按登录域名自动归入正确板块」）
+            store.add_tabbit_account(&verified, import_name, "manual")
+        }
         // WorkBuddy 系的两家（国内版 / 国际版）：同一套凭证形态与落账号路径，
         // 差别只有归属 —— provider id 自己就是归属（拆家后不再从 payload 里的
         // `edition` 反推：那是账号的属性，而落哪一家是身份问题）。
