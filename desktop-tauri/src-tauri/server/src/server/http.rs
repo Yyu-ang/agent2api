@@ -205,6 +205,19 @@ pub fn panel_router(state: ServerState) -> Router {
         // 昵称、各家健康状态、路由中的账号等部署信息（字段清单见 session.rs），
         // 桌面壳的请求由壳带第一把 Key（gateway::request_builder）不受影响。
         .route("/api/session", get(api::session::get_session))
+        // 仅在 protected 管理面开放，权限确认必须由人显式批准。
+        .route(
+            "/api/teleagent/confirmations",
+            get(api::teleagent_confirmations::list),
+        )
+        .route(
+            "/api/teleagent/confirmations/reply",
+            post(api::teleagent_confirmations::reply),
+        )
+        .route(
+            "/api/teleagent/confirmations/view",
+            get(api::teleagent_confirmations::page),
+        )
         .route(
             "/api/config",
             get(api::config_api::get_config)
