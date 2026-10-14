@@ -75,12 +75,32 @@ pub async fn run_chat(
         body.get("tools")
     };
     let tools_enabled = tools.and_then(Value::as_array).is_some_and(|items| !items.is_empty());
-    let prompt = protocol::build_prompt(body.get("messages"), tools);
     let directory = protocol::default_directory();
+    let model_key = format!("{provider_id}/{model_id}");
+    let fingerprints = super::session::fingerprints(body.get("messages"));
+    let mut conversation = match super::session::entry(account_id, &key, &model_key, &directory, body) {
+        Some(state) => Some(state.lock_owned().await),
+        None => None,
+    };
+    if body.get("reset_session").and_then(Value::as_bool) == Some(true) {
+        if let Some(state) = conversation.as_mut() { state.reset(); }
+    }
+    let reuse = conversation.as_ref().and_then(|state| {
+        let id = state.session_id.as_ref()?;
+        let start = super::session::delta_start(&state.sent, &fingerprints)?;
+        Some((id.clone(), start))
+    });
+    let (session_id, prompt) = if let Some((id, start)) = reuse {
+        let messages = super::session::incremental_messages(body, start);
+        (id, protocol::build_prompt(messages.as_ref(), tools))
+    } else {
+        if let Some(state) = conversation.as_mut() { state.reset(); }
+        let id = protocol::create_session_with_key(&directory, &key).await?;
+        (id, protocol::build_prompt(body.get("messages"), tools))
+    };
 
-    // 先开事件流（见模块头「有意差异」），再建会话、再投递
+    // 先建立事件监听再投递消息，减少漏掉早期 delta 的竞态。
     let event_stream = stream::open_event_stream_with_key(&key).await?;
-    let session_id = protocol::create_session_with_key(&directory, &key).await?;
     protocol::prompt_async_with_key(&session_id, &prompt, &directory, &provider_id, &model_id, &key)
         .await?;
 
@@ -96,8 +116,16 @@ pub async fn run_chat(
     }
 
     if stream {
-        Ok(stream::stream_outcome(event_stream, &display_model, &session_id, tools_enabled, &key))
+        Ok(stream::stream_outcome(
+            event_stream, &display_model, &session_id, tools_enabled, &key,
+            conversation, fingerprints,
+        ))
     } else {
-        stream::aggregate(event_stream, &display_model, &session_id, tools_enabled, &key).await
+        let result = stream::aggregate(event_stream, &display_model, &session_id, tools_enabled, &key).await;
+        if let Some(state) = conversation.as_mut() {
+            if result.is_ok() { state.commit(session_id, fingerprints); }
+            else { state.reset(); }
+        }
+        result
     }
 }
