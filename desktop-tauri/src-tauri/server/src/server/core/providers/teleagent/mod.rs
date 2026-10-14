@@ -42,6 +42,7 @@
 pub mod adapter;
 pub mod auth;
 pub mod chat;
+pub mod confirmations;
 pub mod models;
 pub mod protocol;
 pub mod stream;
