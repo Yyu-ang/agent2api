@@ -96,8 +96,8 @@ pub async fn run_chat(
     }
 
     if stream {
-        Ok(stream::stream_outcome(event_stream, &display_model, &session_id, tools_enabled))
+        Ok(stream::stream_outcome(event_stream, &display_model, &session_id, tools_enabled, &key))
     } else {
-        stream::aggregate(event_stream, &display_model, &session_id, tools_enabled).await
+        stream::aggregate(event_stream, &display_model, &session_id, tools_enabled, &key).await
     }
 }
