@@ -73,7 +73,7 @@ pub async fn run_chat(
         .and_then(Value::as_str)
         .unwrap_or("默认")
         .to_string();
-    let model = super::models::resolve_model(region, &client_model);
+    let model = super::models::resolve_model(region, &client_model)?;
     let prompt = build_prompt(body.get("messages"));
     let proxy_ref = proxy.as_ref();
 
