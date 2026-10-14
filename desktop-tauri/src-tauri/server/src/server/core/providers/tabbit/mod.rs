@@ -47,6 +47,7 @@ pub mod login;
 pub mod models;
 pub mod protocol;
 pub mod region;
+pub mod session;
 
 pub use region::Region;
 
