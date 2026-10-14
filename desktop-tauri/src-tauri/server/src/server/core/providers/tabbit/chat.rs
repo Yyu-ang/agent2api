@@ -74,11 +74,34 @@ pub async fn run_chat(
         .unwrap_or("默认")
         .to_string();
     let model = super::models::resolve_model(region, &client_model)?;
-    let prompt = build_prompt(body.get("messages"));
+    let fingerprints = super::session::fingerprints(body.get("messages"));
+    // 只有显式 conversation_id 才启用复用；没有身份的兼容调用维持请求隔离。
+    let mut conversation = match super::session::entry(region, account_id, &credentials.token, &model, body) {
+        Some(state) => Some(state.lock_owned().await),
+        None => None,
+    };
+    if body.get("reset_session").and_then(Value::as_bool) == Some(true) {
+        if let Some(item) = conversation.as_mut() { item.reset(); }
+    }
+    let previous = conversation.as_ref().and_then(|item| {
+        let id = item.session_id.as_ref()?;
+        let index = super::session::delta_start(&item.sent, &fingerprints)?;
+        Some((id.clone(), index))
+    });
+    let messages = body.get("messages");
+    let (session_id, prompt) = if let Some((id, start)) = previous {
+        let delta = messages.and_then(Value::as_array)
+            .map(|items| super::session::delta_messages(items, start))
+            .unwrap_or_default();
+        let prompt = build_prompt(Some(&Value::Array(delta)));
+        (id, prompt)
+    } else {
+        // 会话失效或历史被编辑：新建上游会话并安全回退全量（带 16k 预算）。
+        if let Some(item) = conversation.as_mut() { item.reset(); }
+        let session = create_session(region, &credentials, proxy.as_ref()).await?;
+        (session, build_prompt(messages))
+    };
     let proxy_ref = proxy.as_ref();
-
-    // ── 建会话 ──────────────────────────────────────────────
-    let session_id = create_session(region, &credentials, proxy_ref).await?;
 
     // ── 对话（SSE；499 自动刷新签名 key 重试一次）─────────────
     let url = format!("{}/api/v1/chat/completion", region.base_url());
@@ -93,7 +116,12 @@ pub async fn run_chat(
     }
 
     if !stream {
-        return aggregate(response, &client_model, &prompt).await;
+        let outcome = aggregate(response, &client_model, &prompt).await;
+        if let Some(item) = conversation.as_mut() {
+            if outcome.is_ok() { item.commit(session_id, fingerprints); }
+            else { item.reset(); }
+        }
+        return outcome;
     }
 
     // 流式：后台任务喂 mpsc，主路径返回 ReceiverStream（与 KukuAI 同结构）
@@ -101,34 +129,35 @@ pub async fn run_chat(
     let requested = client_model;
     let prompt_chars = prompt.chars().count();
     crate::spawn_task(async move {
+        // OwnedMutexGuard 持有到完整 SSE 完成，避免同一上游会话并发发送。
+        let mut conversation = conversation;
         let mut response = response;
+        let session_id = session_id;
         for attempt in 0..=BUSY_RETRY_MAX {
             match drive_stream(response, &requested, prompt_chars, &sender).await {
-                Ok(()) => break,
+                Ok(()) => {
+                    if let Some(state) = conversation.as_mut() {
+                        state.commit(session_id.clone(), fingerprints.clone());
+                    }
+                    break;
+                }
                 Err(error) if is_busy_retry(&error) && attempt < BUSY_RETRY_MAX => {
-                    // SSE 内的 409 发生于 HTTP 200 之后，必须由后台驱动自己重试。
-                    // converter 只在未产生任何内容时才生成 BUSY_RETRY 标记。
-                    crate::server::logging::verbose("[Tabbit]", "上游 SSE 返回会话忙，重建会话并重试");
+                    // 复用同一会话，延时后重新发送；不能重建会话却只发增量历史。
                     tokio::time::sleep(std::time::Duration::from_millis(BUSY_WAIT_MS)).await;
-                    let new_session = match create_session(region, &credentials, proxy.as_ref()).await {
-                        Ok(session) => session,
-                        Err(error) => {
-                            let _ = sender.send(Err(std::io::Error::other(error.message))).await;
-                            break;
-                        }
-                    };
-                    let payload = protocol::chat_body(&new_session, &prompt, &model);
+                    let payload = protocol::chat_body(&session_id, &prompt, &model);
                     response = match send_chat_with_retry(
-                        region, &credentials, &new_session, &payload, &url, proxy.as_ref(),
+                        region, &credentials, &session_id, &payload, &url, proxy.as_ref(),
                     ).await {
                         Ok(next) => next,
                         Err(error) => {
+                            if let Some(state) = conversation.as_mut() { state.reset(); }
                             let _ = sender.send(Err(std::io::Error::other(error.message))).await;
                             break;
                         }
                     };
                 }
                 Err(error) => {
+                    if let Some(state) = conversation.as_mut() { state.reset(); }
                     crate::server::logging::verbose("[Tabbit]", &format!("对话流处理中断：{}", error.message));
                     let _ = sender.send(Err(std::io::Error::other(error.message))).await;
                     break;
@@ -528,7 +557,7 @@ async fn drive_stream(
         for frame in frames {
             let wire = frame.wire();
             if sender.send(Ok(Bytes::from(wire))).await.is_err() {
-                return Ok(());
+                return Err(GatewayError::with_status(499, "Tabbit 客户端断开连接"));
             }
         }
     }
