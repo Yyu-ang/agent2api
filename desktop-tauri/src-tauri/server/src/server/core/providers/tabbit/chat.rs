@@ -233,31 +233,35 @@ enum TabbitEvent {
 /// 按 `\n\n` 分帧、逐帧取 `event:` / `data:` 的解析器。
 #[derive(Default)]
 struct SseScanner {
-    buffer: String,
+    buffer: Vec<u8>,
 }
 
 impl SseScanner {
-    fn push(&mut self, text: &str) -> Vec<TabbitEvent> {
-        self.buffer.push_str(text);
+    fn push(&mut self, bytes: &[u8]) -> Vec<TabbitEvent> {
+        self.buffer.extend_from_slice(bytes);
         let mut events = Vec::new();
-        while let Some(split_at) = self.buffer.find("\n\n") {
-            let raw: String = self.buffer.drain(..=split_at + 1).collect();
-            let mut name: Option<&str> = None;
-            let mut data_lines: Vec<&str> = Vec::new();
-            for line in raw.split('\n') {
-                if let Some(event) = line.strip_prefix("event:") {
-                    name = Some(event.trim());
-                } else if let Some(data) = line.strip_prefix("data:") {
-                    data_lines.push(data.trim());
-                }
+        while let Some((at, width)) = {
+            let crlf = self.buffer.windows(4).position(|x| x == b"\r\n\r\n").map(|i| (i, 4));
+            let lf = self.buffer.windows(2).position(|x| x == b"\n\n").map(|i| (i, 2));
+            match (crlf, lf) {
+                (Some(a), Some(b)) => Some(if a.0 < b.0 { a } else { b }),
+                (Some(a), None) => Some(a),
+                (None, Some(b)) => Some(b),
+                _ => None,
             }
-            if name.is_none() && data_lines.is_empty() {
-                continue;
+        } {
+            let raw: Vec<u8> = self.buffer.drain(..at + width).collect();
+            let Ok(text) = String::from_utf8(raw) else { continue };
+            let mut event_name: Option<&str> = None;
+            let mut data = Vec::new();
+            for line in text.lines() {
+                let line = line.trim_end_matches('\r');
+                if let Some(name) = line.strip_prefix("event:") { event_name = Some(name.trim()); }
+                if let Some(payload) = line.strip_prefix("data:") { data.push(payload.trim_start()); }
             }
-            let data_str = data_lines.join("\n");
-            let parsed: Value = serde_json::from_str(&data_str).unwrap_or(Value::Null);
-            for event in event_from_parts(name.unwrap_or("message_chunk"), &parsed) {
-                events.push(event);
+            let parsed = serde_json::from_str::<Value>(&data.join("\n")).unwrap_or(Value::Null);
+            if event_name.is_some() || !data.is_empty() {
+                events.extend(event_from_parts(event_name.unwrap_or("message_chunk"), &parsed));
             }
         }
         events
@@ -347,12 +351,12 @@ impl TabbitStream {
     }
 
     /// 喂一段字节，返回该段触发的帧；上游错误事件 → Err（调用方按分类处理）。
-    fn feed(&mut self, text: &str) -> Result<Vec<Frame>, GatewayError> {
+    fn feed(&mut self, bytes: &[u8]) -> Result<Vec<Frame>, GatewayError> {
         if self.saw_end {
             return Ok(Vec::new());
         }
         let mut frames = Vec::new();
-        for event in self.scanner.push(text) {
+        for event in self.scanner.push(bytes) {
             match event {
                 TabbitEvent::Delta(delta) => {
                     self.content.push_str(&delta);
@@ -451,8 +455,7 @@ async fn drive_stream(
         let bytes = item.map_err(|error| {
             GatewayError::with_status(502, format!("Tabbit 上游流读取失败：{error}"))
         })?;
-        let text = String::from_utf8_lossy(&bytes);
-        let frames = converter.feed(&text)?;
+        let frames = converter.feed(&bytes)?;
         for frame in frames {
             let wire = frame.wire();
             if sender.send(Ok(Bytes::from(wire))).await.is_err() {
@@ -460,11 +463,9 @@ async fn drive_stream(
             }
         }
     }
-    for frame in converter.finish() {
-        let wire = frame.wire();
-        let _ = sender.send(Ok(Bytes::from(wire))).await;
+    if !converter.saw_end {
+        return Err(GatewayError::with_status(502, "Tabbit 上游流提前结束，未收到 finish/close/cancel"));
     }
-    let _ = sender.send(Ok(Bytes::from("")));
     Ok(())
 }
 
@@ -481,9 +482,8 @@ async fn aggregate(
         let bytes = item.map_err(|error| {
             GatewayError::with_status(502, format!("Tabbit 上游流读取失败：{error}"))
         })?;
-        let text = String::from_utf8_lossy(&bytes);
-        // 复用 feed 的事件解析，但只收内容（reasoning 单独记）
-        for event in converter.scanner.push(&text) {
+        // 等完整 SSE 帧到齐后再解码（reasoning 单独记）
+        for event in converter.scanner.push(&bytes) {
             match event {
                 TabbitEvent::Delta(delta) => {
                     converter.content.push_str(&delta);
@@ -508,6 +508,9 @@ async fn aggregate(
             }
         }
     }
+    if !converter.saw_end {
+        return Err(GatewayError::with_status(502, "Tabbit 上游流提前结束，未收到 finish/close/cancel"));
+    }
     let mut message = Map::new();
     message.insert("role".to_string(), json!("assistant"));
     message.insert("content".to_string(), json!(converter.content));
@@ -525,15 +528,23 @@ async fn aggregate(
     body.insert("model".to_string(), json!(model));
     body.insert("choices".to_string(), Value::Array(vec![Value::Object(choice)]));
     body.insert("system_fingerprint".to_string(), json!("tabbit"));
-    // 上游 SSE 不返回 usage（参考实现本地估算）：这里给字符数，调用方按需换算
-    body.insert(
-        "usage".to_string(),
-        json!({
-            "prompt_tokens": prompt.chars().count(),
-            "completion_tokens": converter.content.chars().count(),
-            "total_tokens": prompt.chars().count() + converter.content.chars().count(),
-        }),
-    );
+    // 上游 SSE 未可靠提供 token usage；以 CJK=1、其它字符每 4 字约 1 token 粗估。
+    let estimate = |text: &str| -> usize {
+        let mut latin = 0usize;
+        let mut cjk = 0usize;
+        for c in text.chars() {
+            if ('\u{4e00}'..='\u{9fff}').contains(&c) { cjk += 1; }
+            else { latin += 1; }
+        }
+        cjk + latin.div_ceil(4)
+    };
+    let prompt_tokens = estimate(prompt);
+    let completion_tokens = estimate(&converter.content);
+    body.insert("usage".to_string(), json!({
+        "prompt_tokens": prompt_tokens,
+        "completion_tokens": completion_tokens,
+        "total_tokens": prompt_tokens + completion_tokens,
+    }));
     Ok(ForwardOutcome::Completion { body: Value::Object(body) })
 }
 
