@@ -40,7 +40,7 @@ use crate::server::errors::GatewayError;
 use super::auth::{base_http_url, sign_headers, sign_headers_with_key};
 
 /// 事件流监听超时（原实现 `SSEListener` 默认 120 秒）
-const LISTEN_TIMEOUT_MS: u64 = 120_000;
+const LISTEN_TIMEOUT_MS: u64 = 10 * 60_000;
 /// 流空闲兜底（与 kuku 的 `STREAM_IDLE_MS` 同值；编排层另有统一 idle_guard）
 const STREAM_IDLE_MS: u64 = 10 * 60_000;
 
