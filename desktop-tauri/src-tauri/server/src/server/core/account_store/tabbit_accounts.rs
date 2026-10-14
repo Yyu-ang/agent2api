@@ -205,7 +205,7 @@ impl AccountStore {
             "rateLimits".to_string(),
             record.get("rateLimits").cloned().unwrap_or_else(|| Value::Object(Map::new())),
         );
-        public.insert("available".to_string(), Value::Bool(true));
+        public.insert("available".to_string(), Value::Bool(record.enabled()));
         Value::Object(public)
     }
 }
