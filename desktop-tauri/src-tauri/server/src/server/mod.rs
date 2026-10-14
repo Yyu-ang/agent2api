@@ -575,6 +575,9 @@ impl ServerState {
         // 值得一个能被直接找到的位置，所以整组搬到了那个文件。
         if !upgrade_pending {
             account_bootstrap::run(&store);
+            // Optional GPL sidecar is a separate program. Register its private
+            // HTTP endpoint as a normal custom provider only when opted in.
+            core::opencode2api_bridge::bootstrap(&store);
             // 统计侧的一次性口径订正：模型维度从「请求名（映射别名）」重算成
             // 「上游真名」（见 `RequestStats::remap_model_dimension_once`）。
             // 与 account_bootstrap 同一模式：待迁移旧数据没导入时跳过 ——
