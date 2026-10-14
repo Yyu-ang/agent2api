@@ -152,3 +152,10 @@ mod tests {
         assert!(!serialized.contains("secret-not-for-ui"));
     }
 }
+
+
+pub fn has_pending(session_id: &str) -> bool {
+    let mut pending = guard();
+    prune(&mut pending, crate::server::logging::now_ms());
+    pending.values().any(|entry| entry.session_id == session_id)
+}
