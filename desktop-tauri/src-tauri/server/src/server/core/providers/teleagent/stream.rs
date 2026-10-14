@@ -316,12 +316,20 @@ impl TeleAgentStream {
     }
 
     fn tool_chunk(&self, calls: Vec<Value>) -> Frame {
+        // OpenAI Chat Completions 的流式 tool_calls 每项都需要 index；
+        // 非流式 message.tool_calls 则保持普通 id/type/function 结构。
+        let indexed = calls.into_iter().enumerate().map(|(index, mut call)| {
+            if let Value::Object(ref mut object) = call {
+                object.insert("index".to_string(), json!(index));
+            }
+            call
+        }).collect::<Vec<_>>();
         Frame::Chunk(json!({
             "id": self.id,
             "object": "chat.completion.chunk",
             "created": self.created,
             "model": self.model,
-            "choices": [{"index": 0, "delta": {"tool_calls": calls}, "finish_reason": null}]
+            "choices": [{"index": 0, "delta": {"tool_calls": indexed}, "finish_reason": null}]
         }))
     }
 
@@ -612,4 +620,14 @@ mod parity_tests {
         assert_eq!(text, "[TOOL_CALL]oops[/TOOL_CALL]");
         assert!(calls.is_empty());
     }
+
+    #[test]
+    fn stream_tool_calls_include_index() {
+        let stream=super::TeleAgentStream::new("NewApi/chat-pro","test-session",true,"unit-test-key");
+        let (_, calls)=parse_tool_calls(r#"[TOOL_CALL]{"name":"search","arguments":{"q":"a"}}[/TOOL_CALL]"#);
+        let frame=stream.tool_chunk(calls);
+        let value=match frame { super::Frame::Chunk(v)=>v, _=>panic!("expected chunk") };
+        assert_eq!(value["choices"][0]["delta"]["tool_calls"][0]["index"],0);
+    }
+
 }
