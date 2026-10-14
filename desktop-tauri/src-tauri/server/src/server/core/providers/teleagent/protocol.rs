@@ -11,9 +11,9 @@
 //!     压成单条 prompt 文本：system 拼接在前、assistant 前缀 `[assistant]`、
 //!     tool 结果前缀 `[tool_result]`，与原实现逐字同口径）。
 //!
-//! 不搬的：`get_or_create_session` 的标题复用（机器人场景的；网关每次请求
-//! 独立会话，见 `chat.rs`）、`reply_permission` / `reply_question`（网关无法
-//! 代用户做确认，见 `stream.rs` 的处置）、`get_messages`（排障用，不需要）。
+//! 会话复用按明确 conversation_id 进行（见 `session.rs`）；权限/问题确认
+//! 通过 `confirmations.rs` 和 `reply_confirmation_with_key` 交给用户处理。
+//! 未移植基于标题模糊匹配会话（容易跨用户串线）与完整上游消息浏览。
 //!
 //! ── 硬约束 ──────────────────────────────────────────────────
 //! release 是 `panic=abort`：本文件零 unwrap/expect/panic；持锁不跨 await。
