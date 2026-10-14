@@ -67,12 +67,9 @@ If the provisional `sota` catalogue remains, open Agent2API's model management f
 
 ## Desktop / existing standalone service
 
-Agent2API's **Add account → Preset API** selection includes:
+Agent2API's **Add account → Preset API** selection includes `OpenCode2API (本机)`, defaulting to `http://127.0.0.1:8080/v1`, for an independently running local OpenCode2API executable.
 
-- `OpenCode2API (本机)` with default `http://127.0.0.1:8080/v1` (for an independently running local opencode2api executable).
-- `OpenCode2API (Docker)` with default `http://opencode2api:8080/v1` (Docker-internal DNS; accessible only from containers on the same Compose network).
-
-Use the upstream **`server_keys`** value as the **custom account API Key**, then fetch upstream models using the normal model-management UI. These presets do not launch an upstream process.
+Use the upstream **`server_keys`** value as the **custom account API Key**, then fetch upstream models using the normal model-management UI. This preset does not launch an upstream process. Docker deployments do not need a Docker-specific UI preset: the startup bridge registers the internal `http://opencode2api:8080/v1` address automatically.
 
 ## Source and license
 
