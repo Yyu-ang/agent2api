@@ -42,7 +42,7 @@ use super::auth::{base_http_url, sign_headers, sign_headers_with_key};
 /// 事件流监听超时（原实现 `SSEListener` 默认 120 秒）
 const LISTEN_TIMEOUT_MS: u64 = 120_000;
 /// 流空闲兜底（与 kuku 的 `STREAM_IDLE_MS` 同值；编排层另有统一 idle_guard）
-const STREAM_IDLE_MS: u64 = 120_000;
+const STREAM_IDLE_MS: u64 = 10 * 60_000;
 
 /// 一条已解析的上游事件。
 enum TeleAgentEvent {
@@ -53,7 +53,7 @@ enum TeleAgentEvent {
     /// 上游错误（message/part 的 error）
     Error(String),
     /// 上游在等待用户确认（网关无法代答，中断本轮）
-    NeedConfirmation(String),
+    NeedConfirmation { kind: &'static str, properties: Value },
 }
 
 /// 按 `\n\n` 分帧、逐帧取 `data:` 前缀 JSON 的解析器（与 kuku 的
@@ -199,25 +199,8 @@ impl SseScanner {
                 None
             }
             "permission.asked" | "question.asked" => {
-                let description = props
-                    .get("description")
-                    .or_else(|| props.get("prompt"))
-                    .and_then(Value::as_str)
-                    .unwrap_or("")
-                    .to_string();
-                let kind = if etype == "permission.asked" {
-                    "权限确认"
-                } else {
-                    "问题确认"
-                };
-                Some(TeleAgentEvent::NeedConfirmation(format!(
-                    "TeleAgent 请求用户{kind}（网关无法代答）：{}",
-                    if description.is_empty() {
-                        "（无描述）"
-                    } else {
-                        description.as_str()
-                    }
-                )))
+                let kind = if etype == "permission.asked" { "permission" } else { "question" };
+                Some(TeleAgentEvent::NeedConfirmation { kind, properties: props.clone() })
             }
             _ => None,
         }
@@ -252,10 +235,11 @@ struct TeleAgentStream {
     /// 非流式聚合用（也用于判断「发过内容就不再改判错误」）
     content: String,
     tools_enabled: bool,
+    key: String,
 }
 
 impl TeleAgentStream {
-    fn new(model: &str, session_id: &str, tools_enabled: bool) -> Self {
+    fn new(model: &str, session_id: &str, tools_enabled: bool, key: &str) -> Self {
         Self {
             id: format!("chatcmpl-tg{}", crate::server::logging::now_ms()),
             created: crate::server::logging::now_ms() / 1000,
@@ -264,6 +248,7 @@ impl TeleAgentStream {
             saw_end: false,
             content: String::new(),
             tools_enabled,
+            key: key.to_string(),
         }
     }
 
@@ -281,6 +266,8 @@ impl TeleAgentStream {
                     if !self.tools_enabled { frames.push(self.chunk(delta, None)); }
                 }
                 TeleAgentEvent::Done => {
+                    // 等待人工确认时上游可能暂时进入 idle，不能提前关闭回答流。
+                    if super::confirmations::has_pending(&self.scanner.session_id) { continue; }
                     self.saw_end = true;
                     let mut finish = "stop";
                     if self.tools_enabled {
@@ -305,10 +292,14 @@ impl TeleAgentStream {
                     frames.push(self.chunk(String::new(), Some("stop")));
                     frames.push(Frame::Done);
                 }
-                TeleAgentEvent::NeedConfirmation(message) => {
-                    crate::server::logging::verbose("[TeleAgent]", &message);
-                    self.saw_end = true;
-                    return Err(GatewayError::with_status(502, message));
+                TeleAgentEvent::NeedConfirmation { kind, properties } => {
+                    super::confirmations::record(
+                        kind, &self.scanner.session_id, &properties, &self.key,
+                    )?;
+                    crate::server::logging::log(
+                        "[TeleAgent]", "上游等待人工确认，可通过 /api/teleagent/confirmations 处理",
+                    );
+                    // 不批准也不中断原会话；继续监听直到用户在受保护的管理 API 里回复。
                 }
             }
         }
@@ -447,6 +438,7 @@ pub async fn drive_stream(
     model: &str,
     session_id: &str,
     tools_enabled: bool,
+    key: &str,
     sender: &tokio::sync::mpsc::Sender<Result<Bytes, std::io::Error>>,
 ) -> Result<(), GatewayError> {
     let source = response
@@ -456,7 +448,7 @@ pub async fn drive_stream(
         Box::pin(source),
         std::time::Duration::from_millis(STREAM_IDLE_MS),
     );
-    let mut stream = TeleAgentStream::new(model, session_id, tools_enabled);
+    let mut stream = TeleAgentStream::new(model, session_id, tools_enabled, key);
     while let Some(item) = source.next().await {
         let chunk = item.map_err(|error| {
             GatewayError::with_status(502, format!("TeleAgent 上游流式传输中断: {error}"))
@@ -487,6 +479,7 @@ pub async fn aggregate(
     client_model: &str,
     session_id: &str,
     tools_enabled: bool,
+    key: &str,
 ) -> Result<crate::server::core::upstream::ForwardOutcome, GatewayError> {
     let source = response
         .bytes_stream()
@@ -495,7 +488,7 @@ pub async fn aggregate(
         Box::pin(source),
         std::time::Duration::from_millis(STREAM_IDLE_MS),
     );
-    let mut stream = TeleAgentStream::new(client_model, session_id, tools_enabled);
+    let mut stream = TeleAgentStream::new(client_model, session_id, tools_enabled, key);
     while let Some(item) = source.next().await {
         let chunk = item.map_err(|error| {
             GatewayError::with_status(502, format!("TeleAgent 上游流式传输中断: {error}"))
@@ -538,12 +531,14 @@ pub fn stream_outcome(
     model: &str,
     session_id: &str,
     tools_enabled: bool,
+    key: &str,
 ) -> crate::server::core::upstream::ForwardOutcome {
     let (sender, receiver) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(64);
     let model = model.to_string();
     let session_id = session_id.to_string();
+    let key = key.to_string();
     crate::spawn_task(async move {
-        let outcome = drive_stream(response, &model, &session_id, tools_enabled, &sender).await;
+        let outcome = drive_stream(response, &model, &session_id, tools_enabled, &key, &sender).await;
         if let Err(error) = outcome {
             crate::server::logging::verbose("[TeleAgent]", &format!("对话流处理中断：{}", error.message));
             let _ = sender.send(Err(std::io::Error::other(error.message))).await;
