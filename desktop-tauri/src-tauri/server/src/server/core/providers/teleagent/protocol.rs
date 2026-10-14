@@ -359,7 +359,7 @@ pub fn default_directory() -> String {
 ///     `image_understanding` 工具查看 —— 这里目录改名 `teleagent_vision`，
 ///     其余逐字保留）；
 ///   - 只有一条 user 且无 system 时直接用那条内容，否则 `\n\n` 连接。
-pub fn build_prompt(messages: Option<&Value>) -> String {
+pub fn build_prompt(messages: Option<&Value>, tools: Option<&Value>) -> String {
     let mut system_content: Option<String> = None;
     let mut user_messages: Vec<String> = Vec::new();
 
@@ -379,6 +379,29 @@ pub fn build_prompt(messages: Option<&Value>) -> String {
                 "tool" => user_messages.push(format!("[tool_result] {content}")),
                 _ => user_messages.push(content),
             }
+        }
+    }
+
+    // 按参考代理的约定，将 function schema 注入 TeleAgent 文本提示词。
+    if let Some(Value::Array(definitions)) = tools {
+        let mut descriptions = Vec::new();
+        for tool in definitions {
+            let function = tool.get("function").unwrap_or(tool);
+            let name = function.get("name").and_then(Value::as_str).unwrap_or("");
+            if name.trim().is_empty() { continue; }
+            let description = function.get("description").and_then(Value::as_str).unwrap_or("");
+            let parameters = function.get("parameters").cloned().unwrap_or_else(|| json!({}));
+            descriptions.push(format!("  - {name}: {description}\n    参数: {parameters}"));
+        }
+        if !descriptions.is_empty() {
+            let instruction = format!(
+                "你可以使用以下工具：\n\n{}\n\n需要调用工具时请只输出：[TOOL_CALL]{{\"name\":\"工具名称\",\"arguments\":{{}}}}[/TOOL_CALL]\n不需要调用工具时正常回复。",
+                descriptions.join("\n")
+            );
+            system_content = Some(match system_content {
+                Some(existing) => format!("{existing}\n\n{instruction}"),
+                None => instruction,
+            });
         }
     }
 
