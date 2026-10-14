@@ -97,6 +97,8 @@ mod parity_tests {
         assert_eq!(delta_start(&a,&b),Some(2));
         let delta=incremental_messages(&json!({"messages":next}),2).unwrap();
         assert_eq!(delta.as_array().unwrap().len(),3);
-        assert!(delta_start(&a,&fingerprints(Some(&json!([{"role":"user","content":"modified"}]))).is_none());
+        let changed = json!([{"role":"user","content":"modified"}]);
+        let changed_fingerprints = fingerprints(Some(&changed));
+        assert!(delta_start(&a, &changed_fingerprints).is_none());
     }
 }
