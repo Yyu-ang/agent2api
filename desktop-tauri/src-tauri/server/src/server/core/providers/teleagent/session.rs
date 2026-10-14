@@ -37,7 +37,9 @@ pub fn entry(account_id: &str, key: &str, model: &str, directory: &str, body: &V
         .map(str::trim).filter(|id| !id.is_empty() && id.len() <= 512)?;
     let user = body.get("user").and_then(Value::as_str).unwrap_or("");
     let mut hasher = Sha256::new();
-    for item in [account_id, key, model, directory, user, id] {
+    let tools = body.get("tools").map(Value::to_string).unwrap_or_default();
+    let tool_choice = body.get("tool_choice").map(Value::to_string).unwrap_or_default();
+    for item in [account_id, key, model, directory, user, id, tools.as_str(), tool_choice.as_str()] {
         hasher.update((item.len() as u64).to_be_bytes());
         hasher.update(item.as_bytes());
     }
