@@ -211,6 +211,14 @@ pub fn panel_router(state: ServerState) -> Router {
             get(api::teleagent_confirmations::list),
         )
         .route(
+            "/api/provider-conversations",
+            get(api::provider_conversations::list),
+        )
+        .route(
+            "/api/provider-conversations/reset",
+            post(api::provider_conversations::reset),
+        )
+        .route(
             "/api/teleagent/confirmations/reply",
             post(api::teleagent_confirmations::reply),
         )
