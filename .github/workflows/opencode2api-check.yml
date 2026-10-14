@@ -29,3 +29,14 @@ jobs:
           docker compose --env-file .env.opencode2api \
             -f docker-compose.yml -f docker-compose.opencode2api.yml \
             config --quiet
+
+  rust-server:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: desktop-tauri/src-tauri
+      - name: Check headless gateway crate (shared with Tauri desktop)
+        run: cargo check --manifest-path desktop-tauri/src-tauri/Cargo.toml --package agent2api-server --locked
