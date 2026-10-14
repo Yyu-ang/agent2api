@@ -23,7 +23,7 @@ use serde_json::{Value, json};
 
 use crate::server::errors::GatewayError;
 
-use super::protocol::signed_json;
+use super::protocol::signed_json_with_key;
 use super::{DEFAULT_MODEL_ID, DEFAULT_PROVIDER_ID};
 
 /// 远程目录缓存有效期（10 分钟，与 kuku / raccoon 同值）
@@ -100,8 +100,8 @@ pub fn last_refreshed_at() -> i64 {
 /// 模型目录是全局的：`store` / `account_id` 忽略（签名 key 即凭证，
 /// 见 `auth.rs`）。`refresh_uses_account() = false` 与之配对。
 pub async fn refresh(
-    _store: &crate::server::core::account_store::AccountStore,
-    _account_id: &str,
+    store: &crate::server::core::account_store::AccountStore,
+    account_id: &str,
     force: bool,
 ) -> crate::server::core::providers::adapter::ModelRefreshOutcome {
     // TTL 早退（只有自动路径会走到）
@@ -115,7 +115,11 @@ pub async fn refresh(
         }
         drop(guard);
     }
-    match fetch_remote().await {
+    let key = match crate::server::core::account_store::teleagent_accounts::session_key_for(store, account_id) {
+        Ok(key) => key,
+        Err(error) => return crate::server::core::providers::adapter::ModelRefreshOutcome::failed(error.message),
+    };
+    match fetch_remote(&key).await {
         Ok(models) => {
             let now = crate::server::logging::now_ms();
             let mut guard = remote_guard();
@@ -143,8 +147,8 @@ pub async fn refresh(
 }
 
 /// 真打一次上游目录接口（`GET /provider`，原实现 `_handle_api_models` 口径）。
-async fn fetch_remote() -> Result<Vec<Value>, GatewayError> {
-    let value = signed_json("GET", "/provider", None, CATALOG_TIMEOUT_MS).await?;
+async fn fetch_remote(key: &str) -> Result<Vec<Value>, GatewayError> {
+    let value = signed_json_with_key("GET", "/provider", None, CATALOG_TIMEOUT_MS, key).await?;
     let mut seen: HashMap<String, bool> = HashMap::new();
     let mut models: Vec<Value> = Vec::new();
     let all = value.get("all").and_then(Value::as_array);
@@ -186,13 +190,13 @@ async fn fetch_remote() -> Result<Vec<Value>, GatewayError> {
 /// 接受 `NewApi/chat-pro` / `teleagent/NewApi/chat-pro` / 裸名；
 /// 未知模型显式回退默认（上游对未知名会报错，显式回退更清晰，
 /// 与 kuku 的 `resolve_model` 同一取舍）。
-pub fn resolve_model(name: &str) -> (String, String) {
+pub fn resolve_model(name: &str) -> Result<(String, String), GatewayError> {
     let mut name = name.trim().to_string();
     if let Some(rest) = name.strip_prefix("teleagent/") {
         name = rest.trim().to_string();
     }
     if name.is_empty() {
-        return (DEFAULT_PROVIDER_ID.to_string(), DEFAULT_MODEL_ID.to_string());
+        return Ok((DEFAULT_PROVIDER_ID.to_string(), DEFAULT_MODEL_ID.to_string()));
     }
     let known = {
         let guard = remote_guard();
@@ -212,12 +216,12 @@ pub fn resolve_model(name: &str) -> (String, String) {
                 .any(|(provider_id, model_id)| format!("{provider_id}/{model_id}") == name)
     };
     if !known {
-        return (DEFAULT_PROVIDER_ID.to_string(), DEFAULT_MODEL_ID.to_string());
+        return Err(GatewayError::with_status(400, format!("TeleAgent 未知模型：{name}，请刷新模型目录或选择可用模型")));
     }
-    match name.split_once('/') {
+    Ok(match name.split_once('/') {
         Some((provider_id, model_id)) if !provider_id.is_empty() && !model_id.is_empty() => {
             (provider_id.to_string(), model_id.to_string())
         }
         _ => (DEFAULT_PROVIDER_ID.to_string(), name),
-    }
+    })
 }
