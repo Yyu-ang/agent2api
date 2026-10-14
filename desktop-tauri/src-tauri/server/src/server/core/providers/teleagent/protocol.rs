@@ -224,7 +224,7 @@ async fn signed_request_with_key(
 }
 
 /// 一次带签名的 JSON 请求（显式 key 版），返回已解析的 body（2xx 才算成功）。
-async fn signed_json_with_key(
+pub(crate) async fn signed_json_with_key(
     method: &str,
     path: &str,
     body: Option<&Value>,
