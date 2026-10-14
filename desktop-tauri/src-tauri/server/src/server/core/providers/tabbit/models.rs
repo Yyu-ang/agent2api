@@ -116,45 +116,51 @@ fn fallback(region: Region) -> &'static [&'static str] {
 /// 匹配）/ `默认` / `default`（→ 本地区第一个 `free_unlimited` 模型）。
 /// 找不到 → 返回原名（上游对未知模型的行为是「自动切换」，由上游决定；
 /// 不在这里静默改名，见模块头）。
-pub fn resolve_model(region: Region, client_model: &str) -> String {
+pub fn resolve_model(
+    region: Region,
+    client_model: &str,
+) -> Result<String, crate::server::errors::GatewayError> {
     let name = client_model.trim();
-    // 剥板块前缀（`cn/` / `intl/`，大小写不敏感；参考 `_PREFIX_ALIASES` 的子集）
     let bare = match name.split_once('/') {
-        Some((head, tail)) => {
+        Some((head, tail)) if !tail.trim().is_empty() => {
             let lower = head.trim().to_ascii_lowercase();
-            if matches!(lower.as_str(), "cn" | "china" | "domestic" | "intl" | "international" | "overseas" | "global")
-                && !tail.trim().is_empty()
-            {
+            let requested = match lower.as_str() {
+                "cn" | "china" | "domestic" => Some(Region::Cn),
+                "intl" | "international" | "overseas" | "global" => Some(Region::Intl),
+                _ => None,
+            };
+            if let Some(explicit) = requested {
+                if region != explicit {
+                    return Err(crate::server::errors::GatewayError::with_status(
+                        400, format!("Tabbit 模型 {name} 属于其他地区，请选择正确的 Provider"),
+                    ));
+                }
                 tail.trim()
-            } else {
-                name
-            }
+            } else { name }
         }
-        None => name,
+        _ => name,
     };
-    // 默认别名 → 本地区第一个 free_unlimited
-    let lower = bare.to_ascii_lowercase();
-    if matches!(lower.as_str(), "默认" | "default" | "best" | "free") {
-        if let Some(display) = first_free_unlimited(region) {
-            return display;
-        }
-        return bare.to_string();
+    let norm = |text: &str| -> String {
+        text.chars().filter(|c| c.is_alphanumeric()).flat_map(|c| c.to_lowercase()).collect()
+    };
+    let lower = norm(bare);
+    if matches!(lower.as_str(), "默认" | "default" | "best" | "free" | "最佳") {
+        if let Some(display) = first_free_unlimited(region) { return Ok(display); }
     }
-    // 本地区精确匹配（display_name 或 id 后半）
     for item in list(region) {
         let display = item.get("display_name").and_then(Value::as_str).unwrap_or("");
-        if display.eq_ignore_ascii_case(bare) {
-            return display.to_string();
+        if norm(display) == lower {
+            return Ok(display.to_string());
         }
         if let Some(id) = item.get("id").and_then(Value::as_str) {
             if let Some((_, tail)) = id.split_once('/') {
-                if tail.eq_ignore_ascii_case(bare) {
-                    return display.to_string();
-                }
+                if norm(tail) == lower { return Ok(display.to_string()); }
             }
         }
     }
-    bare.to_string()
+    Err(crate::server::errors::GatewayError::with_status(
+        400, format!("Tabbit 未知模型：{name}，请刷新模型目录并核对 Provider 地区"),
+    ))
 }
 
 fn first_free_unlimited(region: Region) -> Option<String> {
@@ -316,4 +322,18 @@ async fn fetch_remote(
         out.push(entry);
     }
     Ok(out)
+}
+
+
+#[cfg(test)]
+mod model_parity_tests {
+    use super::{resolve_model, Region};
+
+    #[test]
+    fn rejects_cross_region_prefix() {
+        assert!(resolve_model(Region::Cn, "intl/GLM-5.3").is_err());
+        assert!(resolve_model(Region::Intl, "cn/GLM-5.3").is_err());
+        assert_eq!(resolve_model(Region::Cn, "cn/glm-5-3").ok().as_deref(), Some("GLM-5.3"));
+        assert!(resolve_model(Region::Cn, "model-that-does-not-exist").is_err());
+    }
 }
