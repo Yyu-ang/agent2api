@@ -182,9 +182,8 @@ async fn create_session(
     headers.push(("Accept".to_string(), "application/json".to_string()));
     headers.push(("Pragma".to_string(), "no-cache".to_string()));
     headers.push(("Cache-Control".to_string(), "no-cache".to_string()));
-    // 空 body 的 POST：http::post_json_value 会拼 Content-Type json 头；
-    // 参考实现发的是 content=b"" —— 这里用空 JSON 对象，上游兼容（空 body）
-    let value = super::http::post_json_value(&url, &headers, &json!({}), proxy, Some(REQUEST_TIMEOUT_MS))
+    // 与参考客户端一致：零字节 POST body，不是 JSON "{}"。
+    let value = super::http::post_empty_value(&url, &headers, proxy, Some(REQUEST_TIMEOUT_MS))
         .await?;
     let session_id = value
         .get("chat_session_id")
