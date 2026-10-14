@@ -199,33 +199,72 @@ async fn send_chat_with_retry(
 }
 
 /// 把 OpenAI messages 拍平成单条 prompt（上游 content 是单文本，参考同口径）。
+const PROMPT_BUDGET: usize = 16_000;
+const MAX_SINGLE_MESSAGE: usize = 9_000;
+
+/// 裁剪单条超长消息，保留头尾，并明确告诉上游内容发生了截断。
+fn excerpt(text: &str, limit: usize) -> String {
+    let total = text.chars().count();
+    if total <= limit { return text.to_string(); }
+    let marker = "\n[较早的内容已截断]\n";
+    let room = limit.saturating_sub(marker.chars().count());
+    let head = room * 2 / 3;
+    let tail = room - head;
+    let prefix: String = text.chars().take(head).collect();
+    let suffix: String = text.chars().rev().take(tail).collect::<Vec<_>>().into_iter().rev().collect();
+    format!("{prefix}{marker}{suffix}")
+}
+
+/// 单次 Tabbit API 的实际输入有长度限制。参照 tabbit2api 的 16k/9k 预算：
+/// 保留 system 和最新消息，其余历史从新到旧按剩余预算选取。
 fn build_prompt(messages: Option<&Value>) -> String {
-    let Some(Value::Array(items)) = messages else {
-        return "你好".to_string();
-    };
-    if items.is_empty() {
-        return "你好".to_string();
+    let Some(Value::Array(items)) = messages else { return "你好".to_string(); };
+    if items.is_empty() { return "你好".to_string(); }
+    let mut entries: Vec<(String, bool)> = Vec::new();
+    for msg in items {
+        let role = msg.get("role").and_then(Value::as_str).unwrap_or("user");
+        let Some(content) = content_text(msg) else { continue };
+        if content.trim().is_empty() { continue; }
+        let (text, is_system) = match role {
+            "system" => (format!("[系统指令] {content}"), true),
+            "assistant" => (format!("[助手之前的回复] {content}"), false),
+            "tool" => (format!("[工具执行结果] {content}"), false),
+            _ => (content, false),
+        };
+        entries.push((text, is_system));
     }
-    if items.len() == 1 {
-        return content_text(&items[0]).unwrap_or_else(|| "你好".to_string());
+    if entries.is_empty() { return "你好".to_string(); }
+    if entries.len() == 1 { return excerpt(&entries[0].0, MAX_SINGLE_MESSAGE); }
+    let count = entries.len();
+    let mut chosen = vec![false; count];
+    let mut budget = PROMPT_BUDGET;
+    // 先保留系统指令（多个 system 也独立占预算）。
+    for (idx, (text, is_system)) in entries.iter_mut().enumerate() {
+        if !*is_system { continue; }
+        *text = excerpt(text, MAX_SINGLE_MESSAGE.min(3_000).min(budget));
+        let size = text.chars().count() + 2;
+        if size <= budget { chosen[idx] = true; budget -= size; }
     }
-    let mut lines: Vec<String> = Vec::new();
-    for message in items {
-        let role = message.get("role").and_then(Value::as_str).unwrap_or("user");
-        let Some(text) = content_text(message) else { continue };
-        if text.trim().is_empty() {
-            continue;
+    // 最新一轮用户输入优先，允许截断超大消息但不能整条丢弃。
+    if let Some(idx) = (0..count).rev().find(|&i| !entries[i].1) {
+        let keep = MAX_SINGLE_MESSAGE.min(budget.saturating_sub(2));
+        if keep > 40 {
+            entries[idx].0 = excerpt(&entries[idx].0, keep);
+            let size = entries[idx].0.chars().count() + 2;
+            chosen[idx] = true;
+            budget = budget.saturating_sub(size);
         }
-        match role {
-            "system" => lines.push(format!("[系统指令] {text}")),
-            "assistant" => lines.push(format!("[助手之前的回复] {text}")),
-            _ => lines.push(text),
-        }
     }
-    if lines.is_empty() {
-        return "你好".to_string();
+    // 其余消息从最近往前放，保证总长度不会触发上游超长 492。
+    for idx in (0..count).rev() {
+        if chosen[idx] || entries[idx].1 { continue; }
+        let size = entries[idx].0.chars().count() + 2;
+        if size <= budget { chosen[idx] = true; budget -= size; }
     }
-    lines.join("\n\n")
+    let parts: Vec<String> = entries.into_iter().enumerate()
+        .filter_map(|(idx, (text, _))| chosen[idx].then_some(text))
+        .collect();
+    if parts.is_empty() { "你好".to_string() } else { parts.join("\n\n") }
 }
 
 /// 取一条消息的可读文本（content 字符串或 text 类型的部件数组）。
@@ -624,4 +663,37 @@ pub async fn run_chat_with_busy_retry(
         }
     }
     Err(last_error.unwrap_or_else(|| GatewayError::with_status(502, "Tabbit 会话持续忙碌，重试已耗尽")))
+}
+
+
+#[cfg(test)]
+mod parity_tests {
+    use super::{build_prompt, excerpt, SseScanner, TabbitEvent, PROMPT_BUDGET};
+    use serde_json::json;
+
+    #[test]
+    fn long_history_has_budget_and_preserves_latest_turn() {
+        let messages = json!([
+            {"role": "system", "content": "Always use Rust"},
+            {"role": "user", "content": "first ".repeat(8000)},
+            {"role": "assistant", "content": "middle ".repeat(3000)},
+            {"role": "user", "content": "LATEST QUESTION"}
+        ]);
+        let prompt = build_prompt(Some(&messages));
+        assert!(prompt.chars().count() <= PROMPT_BUDGET);
+        assert!(prompt.contains("Always use Rust"));
+        assert!(prompt.contains("LATEST QUESTION"));
+        assert_eq!(excerpt("hello", 10), "hello");
+    }
+
+    #[test]
+    fn sse_utf8_split_and_crlf_are_decoded() {
+        let wire = "event: message_chunk\r\ndata: {\"content\":\"中文完整\"}\r\n\r\n";
+        let bytes = wire.as_bytes();
+        let middle = bytes.iter().position(|x| *x == 0xe4).unwrap_or(0) + 1;
+        let mut parser = SseScanner::default();
+        assert!(parser.push(&bytes[..middle]).is_empty());
+        let events = parser.push(&bytes[middle..]);
+        assert!(matches!(events.first(), Some(TabbitEvent::Delta(s)) if s == "中文完整"));
+    }
 }
