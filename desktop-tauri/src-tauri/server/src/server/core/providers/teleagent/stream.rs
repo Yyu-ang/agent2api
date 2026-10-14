@@ -532,13 +532,20 @@ pub fn stream_outcome(
     session_id: &str,
     tools_enabled: bool,
     key: &str,
+    conversation: Option<tokio::sync::OwnedMutexGuard<super::session::Conversation>>,
+    fingerprints: Vec<String>,
 ) -> crate::server::core::upstream::ForwardOutcome {
     let (sender, receiver) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(64);
     let model = model.to_string();
     let session_id = session_id.to_string();
     let key = key.to_string();
     crate::spawn_task(async move {
+        let mut conversation = conversation;
         let outcome = drive_stream(response, &model, &session_id, tools_enabled, &key, &sender).await;
+        if let Some(state) = conversation.as_mut() {
+            if outcome.is_ok() { state.commit(session_id.clone(), fingerprints); }
+            else { state.reset(); }
+        }
         if let Err(error) = outcome {
             crate::server::logging::verbose("[TeleAgent]", &format!("对话流处理中断：{}", error.message));
             let _ = sender.send(Err(std::io::Error::other(error.message))).await;
