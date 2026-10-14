@@ -1,7 +1,7 @@
 //! TeleAgent 对话转发：建会话 → prompt_async → SSE 事件流 → OpenAI 形状。
 //!
 //! ── 上游时序（移植自 teleagent-openai-proxy，见 `protocol.rs` / `stream.rs`）
-//!   1. `POST /session` 建会话（每次请求新建、用毕即弃，不复用）；
+//!   1. `POST /session` 建会话（首次或历史变更）；明确 conversation_id 时可复用；
 //!   2. `POST /session/{id}/prompt_async` 异步投递 prompt（204/200 即成功）；
 //!   3. `GET /global/event` SSE 按 `sessionID` 过滤收回复，直到
 //!      `session.status → idle`。
@@ -12,9 +12,9 @@
 //! 按会话过滤，早开只会多看到别人的事件（被过滤掉），不会丢自己的。
 //!
 //! ── 多轮与模型 ──────────────────────────────────────────────
-//! super-agent 的会话**自身维护上下文**，但网关每次请求都建新会话，
-//! 因此每次都发**完整历史**压成的 prompt（`protocol::build_prompt`，
-//! 与原实现新会话的口径一致）。模型名经 `models::resolve_model` 归一。
+//! super-agent 的会话自行维护上下文；明确 conversation_id 时按账号、密钥、
+//! 模型、工作目录和工具定义隔离，发送历史新增部分。无会话 ID 时每请求独立，
+//! 历史改写也会新建会话。模型由 `models::resolve_model` 校验，不静默替换。
 //!
 //! ── token 记账 ──────────────────────────────────────────────
 //! 原实现从 `step-finish` part 的 `tokens` 字典提取输入/输出 token，
