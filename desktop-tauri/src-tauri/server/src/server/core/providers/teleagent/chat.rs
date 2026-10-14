@@ -69,7 +69,13 @@ pub async fn run_chat(
     } else {
         client_model.clone()
     };
-    let prompt = protocol::build_prompt(body.get("messages"));
+    let tools = if body.get("tool_choice").and_then(Value::as_str) == Some("none") {
+        None
+    } else {
+        body.get("tools")
+    };
+    let tools_enabled = tools.and_then(Value::as_array).is_some_and(|items| !items.is_empty());
+    let prompt = protocol::build_prompt(body.get("messages"), tools);
     let directory = protocol::default_directory();
 
     // 先开事件流（见模块头「有意差异」），再建会话、再投递
@@ -90,8 +96,8 @@ pub async fn run_chat(
     }
 
     if stream {
-        Ok(stream::stream_outcome(event_stream, &display_model, &session_id))
+        Ok(stream::stream_outcome(event_stream, &display_model, &session_id, tools_enabled))
     } else {
-        stream::aggregate(event_stream, &display_model, &session_id).await
+        stream::aggregate(event_stream, &display_model, &session_id, tools_enabled).await
     }
 }
