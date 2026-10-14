@@ -117,6 +117,13 @@ impl SseScanner {
         if !event_session.is_empty() && event_session != self.session_id {
             return None;
         }
+        // 确认/结束事件是会话级控制信号：缺少归属也不可当成本会话事件。
+        // 全局 SSE 同时服务多个 TeleAgent 任务，不能跨会话关联审批。
+        if matches!(etype, "permission.asked" | "question.asked" | "session.status")
+            && event_session != self.session_id
+        {
+            return None;
+        }
         match etype {
             "message.updated" => {
                 let info = props.get("info")?;
@@ -628,6 +635,18 @@ mod parity_tests {
         let frame=stream.tool_chunk(calls);
         let value=match frame { super::Frame::Chunk(v)=>v, _=>panic!("expected chunk") };
         assert_eq!(value["choices"][0]["delta"]["tool_calls"][0]["index"],0);
+    }
+
+
+    #[test]
+    fn confirmation_events_require_exact_session_id() {
+        let mut scanner = super::SseScanner::new("mine");
+        let foreign = serde_json::json!({"payload":{"type":"permission.asked","properties":{"id":"foreign","sessionID":"other"}}});
+        let missing = serde_json::json!({"payload":{"type":"permission.asked","properties":{"id":"missing"}}});
+        assert!(scanner.event_from_json(&foreign).is_none());
+        assert!(scanner.event_from_json(&missing).is_none());
+        let own = serde_json::json!({"payload":{"type":"permission.asked","properties":{"id":"own","sessionID":"mine"}}});
+        assert!(matches!(scanner.event_from_json(&own), Some(super::TeleAgentEvent::NeedConfirmation{..})));
     }
 
 }
