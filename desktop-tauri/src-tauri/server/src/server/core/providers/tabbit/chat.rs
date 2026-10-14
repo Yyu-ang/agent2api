@@ -101,9 +101,39 @@ pub async fn run_chat(
     let requested = client_model;
     let prompt_chars = prompt.chars().count();
     crate::spawn_task(async move {
-        let outcome = drive_stream(response, &requested, prompt_chars, &sender).await;
-        if let Err(error) = outcome {
-            crate::server::logging::verbose("[Tabbit]", &format!("对话流处理中断：{}", error.message));
+        let mut response = response;
+        for attempt in 0..=BUSY_RETRY_MAX {
+            match drive_stream(response, &requested, prompt_chars, &sender).await {
+                Ok(()) => break,
+                Err(error) if is_busy_retry(&error) && attempt < BUSY_RETRY_MAX => {
+                    // SSE 内的 409 发生于 HTTP 200 之后，必须由后台驱动自己重试。
+                    // converter 只在未产生任何内容时才生成 BUSY_RETRY 标记。
+                    crate::server::logging::verbose("[Tabbit]", "上游 SSE 返回会话忙，重建会话并重试");
+                    tokio::time::sleep(std::time::Duration::from_millis(BUSY_WAIT_MS)).await;
+                    let new_session = match create_session(region, &credentials, proxy.as_ref()).await {
+                        Ok(session) => session,
+                        Err(error) => {
+                            let _ = sender.send(Err(std::io::Error::other(error.message))).await;
+                            break;
+                        }
+                    };
+                    let payload = protocol::chat_body(&new_session, &prompt, &model);
+                    response = match send_chat_with_retry(
+                        region, &credentials, &new_session, &payload, &url, proxy.as_ref(),
+                    ).await {
+                        Ok(next) => next,
+                        Err(error) => {
+                            let _ = sender.send(Err(std::io::Error::other(error.message))).await;
+                            break;
+                        }
+                    };
+                }
+                Err(error) => {
+                    crate::server::logging::verbose("[Tabbit]", &format!("对话流处理中断：{}", error.message));
+                    let _ = sender.send(Err(std::io::Error::other(error.message))).await;
+                    break;
+                }
+            }
         }
     });
     Ok(ForwardOutcome::Stream {
