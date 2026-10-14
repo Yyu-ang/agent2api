@@ -219,7 +219,11 @@ pub async fn refresh(
             return ModelRefreshOutcome::unchanged();
         }
     };
-    let proxy = None;
+    let account = store.tabbit_account_record(region.provider_id(), account_id);
+    let resolution = crate::server::core::proxies::resolve_account_proxy(
+        account.as_ref().and_then(|record| record.get("proxy")),
+    );
+    let proxy = resolution.as_ref().and_then(|item| item.resolved());
     if !force {
         let now = crate::server::logging::now_ms();
         let guard = remote_guard();
@@ -302,8 +306,12 @@ async fn fetch_remote(
             continue;
         }
         let mut entry = listing_entry(region, display.trim());
-        if let Some(access) = model.get("model_access_type") {
-            entry["model_access_type"] = access.clone();
+        // 对外保留能力、会员权益和倍率，供统一模型目录和路由层使用。
+        for key in [
+            "model_access_type", "supports_images", "supports_tools",
+            "support_thinking", "display_multiplier",
+        ] {
+            if let Some(value) = model.get(key) { entry[key] = value.clone(); }
         }
         out.push(entry);
     }
