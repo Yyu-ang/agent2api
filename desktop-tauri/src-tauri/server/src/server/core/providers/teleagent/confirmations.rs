@@ -138,7 +138,7 @@ pub async fn reply(session_id: &str, id: &str, payload: &Value) -> Result<(), Ga
 }
 
 #[cfg(test)]
-mod tests {
+mod parity_tests {
     use super::{record, list};
     use serde_json::json;
     #[test]
