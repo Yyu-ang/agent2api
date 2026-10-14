@@ -483,3 +483,30 @@ fn image_part_text(image_url: Option<&Value>) -> String {
         "[图片解析失败]".to_string()
     }
 }
+
+
+/// 回复需要人工确认的 TeleAgent permission/question。只接受服务器刚发出的 ID。
+pub(crate) async fn reply_confirmation_with_key(
+    kind: &str,
+    id: &str,
+    payload: &Value,
+    key: &str,
+) -> Result<(), GatewayError> {
+    if !matches!(kind, "permission" | "question")
+        || id.is_empty()
+        || id.len() > 256
+        || !id.bytes().all(|b| b.is_ascii_alphanumeric() || b"-_".contains(&b))
+    {
+        return Err(GatewayError::with_status(400, "TeleAgent 确认类型或 ID 非法"));
+    }
+    let path = format!("/{kind}/{id}/reply");
+    let (status, body) = signed_request_with_key("POST", &path, Some(payload), 10_000, key).await?;
+    if matches!(status, 200 | 204) {
+        Ok(())
+    } else {
+        Err(GatewayError::with_status(
+            status as i32,
+            format!("TeleAgent 确认回复失败（HTTP {status}）：{}", body.chars().take(200).collect::<String>()),
+        ))
+    }
+}
