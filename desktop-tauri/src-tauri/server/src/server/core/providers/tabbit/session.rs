@@ -59,13 +59,13 @@ pub fn entry(
     let now = crate::server::logging::now_ms();
     let lock = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
     let mut cache = lock.lock().unwrap_or_else(|p| p.into_inner());
-    cache.retain(|_, item| now.saturating_sub(item.touched) <= TTL_MS);
+    cache.retain(|_, item| now.saturating_sub(item.touched) <= TTL_MS || Arc::strong_count(&item.state) > 1);
     if let Some(item) = cache.get_mut(&key) {
         item.touched = now;
         return Some(Arc::clone(&item.state));
     }
     if cache.len() >= MAX_SESSIONS {
-        if let Some(old) = cache.iter().min_by_key(|(_, item)| item.touched).map(|(k, _)| k.clone()) {
+        if let Some(old) = cache.iter().filter(|(_, item)| Arc::strong_count(&item.state) == 1).min_by_key(|(_, item)| item.touched).map(|(k, _)| k.clone()) {
             cache.remove(&old);
         }
     }
@@ -124,4 +124,36 @@ mod parity_tests {
         assert!(explicit_id(&json!({"messages":[]})).is_none());
         assert_eq!(explicit_id(&json!({"metadata":{"conversation_id":"unique-123"}})),Some("unique-123"));
     }
+}
+
+
+/// 管理面只读快照：不暴露会话名、token 或上游返回内容。
+pub fn stats() -> serde_json::Value {
+    let now = crate::server::logging::now_ms();
+    let map = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    let cache = map.lock().unwrap_or_else(|e| e.into_inner());
+    let sessions = cache.iter().map(|(key, item)| {
+        let busy = Arc::strong_count(&item.state) > 1 || item.state.try_lock().is_err();
+        let (remote, messages) = match item.state.try_lock() {
+            Ok(state) => (state.session_id.is_some(), state.sent.len()),
+            Err(_) => (true, 0),
+        };
+        serde_json::json!({
+            "key": key.chars().take(12).collect::<String>(),
+            "busy": busy,
+            "has_upstream_session": remote,
+            "messages": messages,
+            "idle_ms": now.saturating_sub(item.touched),
+        })
+    }).collect::<Vec<_>>();
+    serde_json::json!({"sessions": sessions, "count": sessions.len()})
+}
+
+/// 删除空闲缓存项。执行中的会话不会被替换，避免管理清理破坏并发互斥。
+pub fn reset_idle() -> usize {
+    let map = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut cache = map.lock().unwrap_or_else(|e| e.into_inner());
+    let old = cache.len();
+    cache.retain(|_, entry| Arc::strong_count(&entry.state) > 1 || entry.state.try_lock().is_err());
+    old.saturating_sub(cache.len())
 }
