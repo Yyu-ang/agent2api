@@ -114,6 +114,7 @@ pub mod routing_api;
 pub mod sanitize;
 pub mod scheduled_tasks;
 pub mod session;
+pub mod teleagent_confirmations;
 pub mod stats_api;
 pub mod storage_api;
 pub mod subscriptions;
