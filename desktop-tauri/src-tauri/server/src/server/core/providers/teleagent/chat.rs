@@ -62,7 +62,7 @@ pub async fn run_chat(
         .and_then(Value::as_str)
         .unwrap_or("")
         .to_string();
-    let (provider_id, model_id) = models::resolve_model(&client_model);
+    let (provider_id, model_id) = models::resolve_model(&client_model)?;
     // 广告出去的模型名（`NewApi/chat-pro` 形态），流式帧里回显它
     let display_model = if client_model.trim().is_empty() {
         format!("{provider_id}/{model_id}")
