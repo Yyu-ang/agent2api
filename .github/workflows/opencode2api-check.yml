@@ -1,0 +1,42 @@
+name: Check OpenCode2API bridge
+
+on:
+  pull_request:
+    branches: [beta]
+    paths:
+      - 'docker-compose.opencode2api.yml'
+      - 'scripts/opencode2api-init*.mjs'
+      - 'integrations/opencode2api/**'
+      - 'desktop-tauri/src-tauri/server/src/server/core/opencode2api_bridge.rs'
+      - '.github/workflows/opencode2api-check.yml'
+  workflow_dispatch:
+
+jobs:
+  initializer:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '22'
+      - name: Check syntax and run isolated tests
+        run: |
+          node --check scripts/opencode2api-init.mjs
+          node --test scripts/opencode2api-init.test.mjs
+      - name: Check Docker Compose overlay
+        run: |
+          node scripts/opencode2api-init.mjs
+          docker compose --env-file .env.opencode2api \
+            -f docker-compose.yml -f docker-compose.opencode2api.yml \
+            config --quiet
+
+  rust-server:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: desktop-tauri/src-tauri
+      - name: Check headless gateway crate (shared with Tauri desktop)
+        run: cargo check --manifest-path desktop-tauri/src-tauri/Cargo.toml --package agent2api-server --locked

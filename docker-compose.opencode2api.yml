@@ -1,0 +1,49 @@
+# Optional OpenCode2API integration: API stays private on the Compose network.
+#
+# One-time: node scripts/opencode2api-init.mjs
+# Start: docker compose --env-file .env.opencode2api \
+#   -f docker-compose.yml -f docker-compose.opencode2api.yml up -d --build
+#
+# Externally visible model gateway remains port 3065 only. The upstream
+# management UI is loopback-only on port 18081, never exposed on LAN.
+# Upstream application/image: jasonxu114514/opencode2api (GPL-3.0-or-later).
+services:
+  agent2api:
+    depends_on:
+      opencode2api:
+        condition: service_healthy
+    environment:
+      AGENT2API_OPENCODE2API_URL: http://opencode2api:8080/v1
+      AGENT2API_OPENCODE2API_KEY: ${OPENCODE2API_SERVER_KEY:?Run node scripts/opencode2api-init.mjs first}
+
+  opencode2api:
+    image: ghcr.io/jasonxu114514/opencode2api:${OPENCODE2API_VERSION:-latest}
+    restart: unless-stopped
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    environment:
+      CONFIG_PATH: /var/lib/opencode2api/config.json
+      CONFIG_SEED_PATH: /run/config/opencode2api.json
+      LISTEN_ADDRESS: 0.0.0.0:8080
+      WEBUI_LISTEN_ADDRESS: 0.0.0.0:8081
+    # No published API port. The Agent2API container accesses port 8080 by
+    # Docker DNS; users continue to call Agent2API at /v1 on port 3065.
+    expose:
+      - "8080"
+    ports:
+      - "127.0.0.1:${OPENCODE2API_WEBUI_PORT:-18081}:8081"
+    configs:
+      - source: opencode2api_seed
+        target: /run/config/opencode2api.json
+    volumes:
+      - opencode2api-state:/var/lib/opencode2api
+    tmpfs:
+      - /tmp
+
+configs:
+  opencode2api_seed:
+    file: ./data/opencode2api/config.json
+
+volumes:
+  opencode2api-state:

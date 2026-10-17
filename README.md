@@ -127,6 +127,25 @@ print(resp.choices[0].message.content)
 
 默认只监听 `127.0.0.1`。开启「设置 → 通用 → 局域网访问」后改听所有网卡，局域网设备把 API 地址指向本机 IP 即可共用（界面会给出完整地址）。出于安全，开启前必须注册面板管理员：管理接口要求管理员会话或网关 Key，无可用 Key 时转发接口同样拒绝服务（开启流程会自动补一把「默认」Key）；也可选择同时开放网页面板（默认关闭）。改动重启生效。
 
+---
+
+## OpenCode2API 可选嵌入（独立 Sidecar）
+
+支持将 [jasonxu114514/opencode2api](https://github.com/jasonxu114514/opencode2api) 作为**独立 Go 服务**接入本项目的统一 OpenAI 兼容网关；保留上游 Zen/Go Key 池、`sota`/`sweet` 路由、模型发现与管理界面，不把 GPLv3 上游源码合入 Rust/Tauri 主程序。
+
+```bash
+node scripts/opencode2api-init.mjs
+docker compose --env-file .env.opencode2api \
+  -f docker-compose.yml -f docker-compose.opencode2api.yml \
+  up -d --build
+```
+
+初始化时可通过环境变量 `OPENCODE2API_ZEN_KEYS` / `OPENCODE2API_GO_KEYS` 输入上游 Key；没有上游 Key 时默认启用上游的匿名模式。默认只公开 Agent2API 的 `3065/v1` 接口，OpenCode2API API 仅 Docker 内可访问，其 WebUI 仅监听宿主机 `127.0.0.1:18081`。两份密钥配置位于本地忽略目录，不应提交。
+
+[部署步骤、功能边界与故障排查](./integrations/opencode2api/README.md)。桌面端还提供「OpenCode2API（本机）」手动接入预置项，但**未将 Go 二进制打包进安装程序**。
+
+---
+
 ## 🐳 Docker 部署
 
 ```bash

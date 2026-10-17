@@ -197,6 +197,14 @@
       hint: wbI18n.t('小米 MiMo Token Plan 套餐（新加坡站）'),
     },
     {
+      // Connect to the independent opencode2api Go gateway on the host.
+      // This is NOT the direct OpenCode Zen/Go preset below; its API Key is
+      // opencode2api's local server key, not a Zen or Go upstream key.
+      key: 'opencode2api-local', name: 'OpenCode2API (本机)', icon: 'opencode-go.png',
+      protocol: P.openai, baseUrl: 'http://127.0.0.1:8080/v1',
+      hint: wbI18n.t('连接独立运行的 jasonxu114514/opencode2api。填它的 server_keys 本地网关 Key，而非 Zen/Go Key；模型列表从它的 /v1/models 获取。'),
+    },
+    {
       key: 'opencode-go', name: 'OpenCode Go', icon: 'opencode-go.png',
       // Go 面与免费档的要求不同：网关按端点自动补上游要求的会话头
       // （x-opencode-session）与产品 UA，**不需要开伪装开关**（那是 Zen
