@@ -54,6 +54,26 @@ use crate::server::core::providers::DEFAULT_PROVIDER_ID;
 use crate::server::core::proxies::describe_account_proxy;
 use crate::server::logging;
 
+/// 单账号并发上限的封顶值（0 = 不限）。界面输入框用的是同一个数
+/// （ui-islands 的 `CONC_MAX`）；两处要对得上，否则会「界面让填、接口回 400」。
+pub(crate) const MAX_CONCURRENT_LIMIT: u64 = 999;
+
+/// 归一 `maxConcurrent` 补丁值：必须是**非负整数**（`as_u64` 对浮点 / 负数 /
+/// 字符串一律返回 None）、封顶 [`MAX_CONCURRENT_LIMIT`]。
+///
+/// 单账号（`apply_patch`）与批量（`batch_update`）共用这一份：批量入口若各自
+/// 再写一遍校验，迟早漂成「设置弹窗按 999 挡、批量入口放进一个 5000」。
+pub(crate) fn normalize_max_concurrent(value: &Value) -> Result<u64, AccountStoreError> {
+    match value.as_u64() {
+        Some(number) if number <= MAX_CONCURRENT_LIMIT => Ok(number),
+        // 只有超限才走到这两条；文案说清范围，省得用户对着「非负整数」猜上限
+        Some(_) => Err(AccountStoreError::bad_request(
+            "并发上限必须是不大于 999 的非负整数",
+        )),
+        None => Err(AccountStoreError::bad_request("并发上限必须是非负整数")),
+    }
+}
+
 impl AccountStore {
     // ─── CRUD ────────────────────────────────────────────────
 
@@ -90,8 +110,25 @@ impl AccountStore {
         let auth = object_or_empty(payload_object.get("auth"));
         let account = object_or_empty(payload_object.get("account"));
 
-        let access_token = pick_token(&auth, &["accessToken", "token", "access_token"]);
-        let refresh_token = pick_token(&auth, &["refreshToken", "refresh_token"]);
+        // 嵌套形（官方客户端凭证文件 / wb2api 导出）优先读 `auth` 对象；里面没有
+        // 再回退顶层键 —— wb2api 的手写扁平形（`{"accessToken":…,"refreshToken":…}`）
+        // 没有 `auth` 壳，以前在这里被误判成「缺少 accessToken」。
+        let access_token = {
+            let nested = pick_token(&auth, &["accessToken", "token", "access_token"]);
+            if nested.is_empty() {
+                pick_token(payload_object, &["accessToken", "token", "access_token"])
+            } else {
+                nested
+            }
+        };
+        let refresh_token = {
+            let nested = pick_token(&auth, &["refreshToken", "refresh_token"]);
+            if nested.is_empty() {
+                pick_token(payload_object, &["refreshToken", "refresh_token"])
+            } else {
+                nested
+            }
+        };
         if access_token.is_empty() {
             return Err(AccountStoreError::bad_request("缺少 accessToken"));
         }
@@ -713,6 +750,36 @@ impl AccountStore {
             // serde_json 的序列化键序由插入序决定，与 JS 的对象字面量序一致。
             let before = value_or_nullish(record.get("proxy"), Value::Null);
             if next != before {
+                // ── 「轮询」档的唯一准入闸门（写入侧收口）────────────────
+                // 它只对 OpenCode Zen 有意义：那个免费档不用 API Key、**按 IP
+                // 限流**（某个 IP 的额度用完就对这个 IP 一律 429），轮换出口正是
+                // 解法；别的家按 Key / 订阅额度计费，轮换出口只会让上游看到一串
+                // 互不相关的 IP，属于误用。判据放在这里而不是归一里：归一不认识
+                // 记录，而「这条账号是谁家的」只有记录知道（`is_opencode_zen_account`
+                // 同时排除同域不同档的 OpenCode Go）。
+                //
+                // 闸门在**值真的变化**时才判（不是每次提交都判）：设置弹窗每次
+                // 保存都会把 proxy 原样发回来，而导入进来的记录可能本来就带着
+                // 轮询档（导入刻意不过这道闸，见下）—— 那种账号改个备注名不该
+                // 被一条与本次改动无关的规则挡下。批量改代理同样走本函数
+                // （store_batch 逐账号调 apply_patch），混选里那几条非 Zen 账号
+                // 会各自记入 failed，其余照常生效。
+                //
+                // **导入（account_transfer）刻意不过这道闸**：导出文件要能原样
+                // 搬回来，而导入那一刻本机可能还没有那家提供商（判据会假阴性，
+                // 把一条合法记录挡在门外）；那种情况下轮询取用会按「池里没有
+                // 候选」如实报错，用户看得见原因也能修。
+                if crate::server::core::proxies::is_rotate_config(&next)
+                    && !crate::server::core::custom_providers::is_opencode_zen_account(
+                        &record.provider(),
+                        record.get("baseUrl").and_then(Value::as_str),
+                    )
+                {
+                    return Err(AccountStoreError::bad_request(
+                        "轮询出网只对 OpenCode Zen 账号开放：该上游按 IP 限流，\
+                         轮换出口可以绕开单个 IP 的 429；别的提供商请用「已保存的代理」",
+                    ));
+                }
                 record.set_proxy(next.clone());
                 let label = if next.is_null() {
                     "代理 → 无代理（直连）".to_string()
@@ -729,22 +796,10 @@ impl AccountStore {
         }
 
         if let Some(value) = patch.get("maxConcurrent") {
-            // 单账号并发上限：必须是**非负整数**（`as_u64` 对浮点 / 负数 /
-            // 字符串一律返回 None），封顶 999；0 = 不限。选路消费它时的口径
-            // 见 `routing::max_concurrent_of`（缺失 = 0 = 不限）。
-            const MAX_CONCURRENT_LIMIT: u64 = 999;
-            let next = match value.as_u64() {
-                Some(number) if number <= MAX_CONCURRENT_LIMIT => number,
-                // 999 以内才合法；文案说清范围，省得用户对着「非负整数」猜上限
-                Some(_) => {
-                    return Err(AccountStoreError::bad_request(
-                        "并发上限必须是不大于 999 的非负整数",
-                    ))
-                }
-                None => {
-                    return Err(AccountStoreError::bad_request("并发上限必须是非负整数"))
-                }
-            };
+            // 单账号并发上限：0 = 不限，封顶 999（校验与批量入口同一份，见
+            // `normalize_max_concurrent`）。选路消费它时的口径见
+            // `routing::max_concurrent_of`（缺失 = 0 = 不限）。
+            let next = normalize_max_concurrent(value)?;
             // 缺省记录无此键 = 不限（读侧按 0 处理），所以这里恒存显式数字
             let current = record.get("maxConcurrent").and_then(Value::as_u64).unwrap_or(0);
             if next != current {

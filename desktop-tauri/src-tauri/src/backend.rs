@@ -106,9 +106,11 @@ pub async fn ensure_ready(app: &AppHandle) -> Result<(), StartupFailure> {
     };
 
     // 起服务：日志库与配置在这里初始化（bootstrap 内部完成）。
-    // 失败一律原样返回：`bootstrap` 只在「本该执行的目录迁移没有执行」时返回
-    // Err（防御性校验，见那边的注释）—— 继续下去会把新配置目录建出来，
-    // 让迁移永远无法重试，所以这里必须中断而不是带着错误往下走。
+    // 失败一律原样返回：`bootstrap` 只在「本该执行的目录迁移没有执行」（防御性
+    // 校验，见那边的注释）或「库 schema 版本高于本程序」（通常是回退到了旧版本，
+    // 用旧程序打开会把加密后的账号静默删除）时返回 Err。前者继续下去会把新配置
+    // 目录建出来、让迁移永远无法重试；后者必须明确拒绝降级 —— 所以这里必须中断
+    // 而不是带着错误往下走。
     // 桌面形态默认只听本机回环：管理 API 不出 127.0.0.1；用户显式开启
     // 「局域网访问」后绑 0.0.0.0，此时免鉴权语义由下面的闸门接管
     // （headless 形态由 agent2api-server 二进制按 AGENT2API_HOST 自行决定）。
@@ -690,6 +692,10 @@ pub fn shutdown(state: &AppState) {
     // 会整段跳过，留下一个仍在轮询的循环。stop 自身也是幂等的（task 取走后
     // 再调直接返回），所以不破坏本函数「重复调用无副作用」的既有语义。
     server::core::auto_checkin::stop_global();
+    // 代理内核（mihomo sidecar）：停服务之前先杀它 —— 它是独立子进程，
+    // 父进程退出不会自动带走（Windows 上尤其如此），留着会占着监听端口，
+    // 下次启动还得清理（启动时也有兜底清理，但正常退出就该在这里杀干净）。
+    server::core::sub_kernel::shutdown();
 
     let Ok(mut guard) = state.backend.lock() else {
         return;

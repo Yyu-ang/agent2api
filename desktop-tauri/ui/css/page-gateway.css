@@ -197,7 +197,8 @@
 .page[data-page="gateway"] .models-table thead th { padding: 8px 10px; font-size: 11px; letter-spacing: 0; }
 .page[data-page="gateway"] .models-table td { padding: 7px 10px; }
 
-/* 「模型映射」表头的问号提示（完整口径从括号长标题挪进 title，见 models-page） */
+/* 表头的问号提示（完整口径从括号长标题挪进 title，见 models-page）——
+   「模型映射」「上下文 / 输出」「能力」三处共用；后两处讲的是来源标记怎么读 */
 .page[data-page="gateway"] .models-table .th-help {
   display: inline-flex;
   vertical-align: -2px;
@@ -239,6 +240,20 @@
 .keys-table .k-time { width: 16%; }
 .keys-table .k-state { width: 8%; }
 .keys-table .k-act { width: 10%; }
+
+/* 代理池表（islands/proxies-page.tsx）的默认列宽。
+   与上面两组同一条口径：默认宽度写在**普通类**上、由 colgroup 的 <col> 带上，
+   没拖过的列走它，拖过的列由 table-columns.js 往 <col> 写 inline width 盖掉它。
+   所以这里不能用 Tailwind 的 w-[196px] 那类工具类 —— 组件库的 Tailwind 是
+   `!important` 导出的（见 ui-kit/styles/globals.css），`width: 196px !important`
+   会反过来压住拖动写下的 inline 宽度，表现为「拖完松手、列宽弹回原值」。
+   节点列不给宽度：它是全表唯一内容长度不可控的列（名字 + 协议 + 引用数），
+   由 table-layout: fixed 把剩余宽度分给它。 */
+.proxies-table .p-pick { width: 36px; }
+.proxies-table .p-addr { width: 196px; }
+.proxies-table .p-state { width: 58px; }
+.proxies-table .p-test { width: 28%; }
+.proxies-table .p-act { width: 168px; }
 
 /* 禁用 / 已删除的行整体压淡，开关与操作列保持可点 */
 .models-table tr.off td { opacity: .5; }
@@ -326,6 +341,10 @@
 }
 /* 未声明：压淡而不是换成文字 —— 与「明确声明了 0 / 不支持」一眼可分 */
 .cap-num.unset { color: var(--text-3); opacity: .6; }
+/* 来源是 models.dev 的数值：虚线底边（文字上不能像圆点那样加环 —— 那会贴住
+   数字本身）。与圆点的内侧描边是同一套语义：这一项不是上游说的。
+   悬停提示里会写明「其中 最大输出 Token 由 models.dev 补齐」。 */
+.cap-num.filled { text-decoration: underline dotted var(--text-3); text-underline-offset: 3px; }
 .cap-sep { color: var(--text-3); font-size: 11px; }
 
 /* ── 「来源」列：色点 + 小字（2026-10 重设计）──────────────
@@ -357,6 +376,13 @@
 .cap-dot.on { background: var(--primary-soft); color: var(--primary-fg); }
 .cap-dot.off { background: var(--surface-3); color: var(--text-3); }
 .cap-dot.unset { border: 1px dashed var(--border-strong); color: var(--text-3); opacity: .75; }
+/* 来源是 models.dev 的那几项：在原有三态之上补一圈内侧描边（不改底色）。
+   底色表达的是「支持 / 不支持 / 未声明」（值本身），描边表达的是「这个值不是
+   上游说的、是社区库补的」（可信度）—— 两个维度压进一个样式就再也分不出来。
+   逐项的文字说明在悬停提示里（capabilityTip 会写「（由 models.dev 补齐）」）。
+   描边用静音文字色而不是 --border-strong —— 后者只有 20% 白，压在灰实底上
+   等于看不见（实测过）。 */
+.cap-dot.filled { box-shadow: inset 0 0 0 1px var(--text-3); }
 
 /* 覆盖标记：被用户改过的那一项挂一枚小点（title 说明「已覆盖上游值」）。
    基础 .cap-mark 是行内小点（「上下文 / 输出」格用）；圆点里的那枚绝对定位

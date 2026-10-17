@@ -23,12 +23,13 @@ import { t } from '../i18n'
  *      row 缺失（列表在弹窗打开前恰好刷新过）时显示「数据已刷新，请重试」。
  *   ② 预览对话 —— 调 `getStatsRequestRaw(id)` 拿下游原文（请求体 + 最终响应），
  *      解析与气泡渲染全在 conversation-preview.js（纯函数，这里只取数与给空态）。
- *      404 / 双空给空态：报文有自己的容量闸（按条数与时间丢最旧），
- *      「明细还在、原文已被挤掉」是正常状态，不是错误。
+ *      正文只在**调试模式开启期间**的请求上采集（与上游报文同一个开关，
+ *      对齐 OmniProxy 的口径），所以 404 / 双空给空态：最常见的原因是
+ *      「请求发生时开关没开」，其次是已被清理 —— 都不是错误。
  *   ③ 原始报文 —— 调试模式保存的**上游**原始报文（`getDebugTraffic` 的四段：
  *      请求头 / 请求体 / 响应头 / 响应体，凭据已脱敏），原样保留为四块竖排。
- *      调试模式没开（或超出保留）时**整个标签隐藏** —— 它本来就是可选的排障
- *      数据，缺了不该让用户在两个空标签里找内容。
+ *      调试模式没开（或该条已被淘汰出最近 500 条）时**整个标签隐藏** ——
+ *      它本来就是可选的排障数据，缺了不该让用户在两个空标签里找内容。
  *
  * ── 迁移里最需要保持的三条取舍 ──────────────────────────────
  *   · 两个接口在 open 时**并行**发起，谁到了渲染谁（各自动自己那块与标签条，
@@ -227,6 +228,30 @@ function fmtFirstResponse(ms: unknown): string {
   const value = Number(ms)
   if (!Number.isFinite(value) || value <= 0) return '-'
   return fmtDuration(value)
+}
+
+/** 生成速度（tok/s）的悬停说明（与列表 SPEED_TIP 同一份文案，改口径时一起改） */
+const SPEED_TIP = t('生成速度：输出 token ÷ 流式段用时（总用时 − 首响）；流式段不足总用时一半时按总用时计')
+
+/**
+ * 生成速度（tok/s）：输出 token ÷ 流式段用时（总用时 − 首响）。
+ *
+ * 与列表 requests-page 的 tokensPerSecond 逐字同源（那边是唯一实现，这里是详情
+ * 弹窗的镜像，两边注释互相指认，改口径时一起改）。护栏两条，不满足回落按总用时
+ * 计：流式段 ≥ 500ms（非流式响应 duration ≈ 首响，分母趋零）、流式段 ≥ 总用时
+ * 的一半（静默思考的上游把 token 攒到首帧后的小窗口里一股脑下发，短尾窗口
+ * 除出来是「下发速度」不是「生成速度」，能到 800+ tok/s 的假读数）。
+ * 输出 / 总用时为 0（失败行 token 清零、旧行）给空串 —— 调用方据此省掉这一段。
+ */
+function fmtTokensPerSecond(row: RequestRow): string {
+  const tokens = Number(row.completionTokens) || 0
+  const duration = Number(row.durationMs) || 0
+  if (tokens <= 0 || duration <= 0) return ''
+  const first = Number(row.firstResponseMs)
+  const streamMs = Number.isFinite(first) && first > 0 && first < duration ? duration - first : 0
+  const streaming = streamMs >= 500 && streamMs * 2 >= duration
+  const rate = tokens / ((streaming ? streamMs : duration) / 1000)
+  return `${rate >= 100 ? Math.round(rate) : rate.toFixed(1)} tok/s`
 }
 
 /** 令牌读数：量级词与分档交给 units.js 的 formatTokens（与列表 / 报表页同一口径，
@@ -482,10 +507,12 @@ function RouteReplay({ row }: { row: RequestRow }) {
   if (!route) return null
   const strategy = String(route.strategy || '')
   const sticky = String(route.sticky || '')
-  // 只有两档（顺序优先 / 负载均衡）；历史记录里可能留着已下线的 'usage'，
-  // 按它的替代者「负载均衡」显示（后端 RouteStrategy::from_id 也是这么归的）
+  // 三档（顺序优先 / 负载均衡 / 家内轮询）；历史记录里可能留着已下线的 'usage'，
+  // 按它的替代者「负载均衡」显示（后端 RouteStrategy::from_id 也是这么归的）。
+  // 认不出的取值原样显示 —— 那是「后端有、前端还没跟上」的信号，藏起来更难查。
   const strategyLabel = strategy === 'rotate' || strategy === 'usage' ? t('负载均衡')
-    : strategy === 'order' ? t('顺序优先') : strategy
+    : strategy === 'order' ? t('顺序优先')
+      : strategy === 'provider' ? t('家内轮询') : strategy
   const stickyLabel = sticky === 'auto' ? t('自动') : sticky === 'session' ? t('会话内')
     : sticky === 'turn' ? t('每轮') : sticky === 'off' ? t('关闭') : sticky
   const ordered = Array.isArray(route.ordered) ? route.ordered as Array<Record<string, unknown>> : []
@@ -531,6 +558,7 @@ function DetailPane({ row }: { row: RequestRow | null }) {
   // 没有可显示的数据 —— 说清原因让用户关掉重开，比一片空字段诚实
   if (!row) return <Empty text={t('列表数据已刷新，请重试（关闭后重新打开这条详情）')} />
   const account = String(row.accountName ?? '').trim()
+  const speed = fmtTokensPerSecond(row)
   return (
     // 值列基色打在 table 上靠继承（继承永远输给元素上的直接声明），格内的错误红 / 成功绿不会被压住
     <Table className='text-[12.5px] text-subtle [&_tr:last-child>td]:border-b-0 [&_tr:last-child>th]:border-b-0'>
@@ -545,9 +573,9 @@ function DetailPane({ row }: { row: RequestRow | null }) {
               <span className='text-[11.5px] text-muted-foreground'>{t('（请求仍在转发中）')}</span>
             </>
           ) : (
-            <>{t('{duration} / 首帧 {first}', {
+            t('{duration} / 首帧 {first}', {
               duration: fmtDuration(row.durationMs), first: fmtFirstResponse(row.firstResponseMs),
-            })}</>
+            })
           )}
         </Field>
         <Field label={t('重试次数')}>{String(Number(row.attempts) || 1)}</Field>
@@ -563,6 +591,9 @@ function DetailPane({ row }: { row: RequestRow | null }) {
             total: fmtTokens(row.totalTokens),
             cache: fmtTokens(row.cacheReadTokens),
           })}
+          {/* 生成速度跟在缓存读后面（与列表用量列的落点同一语义）；失败行 token
+              清零，fmtTokensPerSecond 给空串，自动省掉 */}
+          {speed ? <span title={SPEED_TIP}> · {speed}</span> : null}
         </Field>
         {/* 测试发起的请求**按需多一行**：它是这一条明细的性质（走的是真实转发链路、但不进报表），
             正常转发的行不必为此多读一行「正常转发」 —— 那种字段每个租户都有时等于没有 */}
@@ -610,7 +641,7 @@ function PreviewPane({ state }: { state: RawState }) {
   const html = body
     ? shared().wbConversationPreview?.render?.(body.requestBody, body.responseBody) || ''
     : ''
-  if (!html) return <Empty text={t('无报文原文（可能已被清理或超出保留范围）')} />
+  if (!html) return <Empty text={t('无报文原文（未开启「调试模式」，或已被清理）')} />
   return (
     <div>
       {state !== 'gone' && state.truncated ? (

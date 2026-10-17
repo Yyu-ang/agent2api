@@ -25,7 +25,7 @@ import { t } from '../i18n'
  *   window.wbRequestPhase  = { labelOf, badgeHtml, elapsedLineHtml, elapsedText, phaseOf }
  *
  * ── 数据口径（照旧，别改）──────────────────────────────────────
- * 明细按保留期存盘、条数无上限，所以走后端 offset/limit 真分页（每页 50 条 = 后端默认值，显式传
+ * 明细全量保留（不按天数 / 条数自动删除），条数没有上限，所以走后端 offset/limit 真分页（每页 50 条 = 后端默认值，显式传
  * 页数才算得出来）。后端支持时间区间 / 状态 / 模型 / 提供商四个维度，四者在存储层的**同一份
  * FilterPlan** 里编译成 SQL —— 所以「页面上筛出来的 N 条」与「清理弹窗删掉的那批」必然是同一个
  * 集合。前端这份口径只有一处实现（filterParams），列表 GET 与 clearParams 都从它取（见下）。
@@ -76,6 +76,9 @@ type RequestEntry = {
   /** 模型测试发起的请求（后端 `is_test`；此前落盘的老行没有这个键） */
   isTest?: boolean
   phase?: string; phaseElapsedMs?: number | null; phaseStartedAt?: number | null
+  /** 来源客户端（后端 `client`：入口按下游 User-Agent 分类的结果；
+   *  空串 / 缺键 = 没有记录 —— 旧行、模型测试、请求未带 UA 的行） */
+  client?: string
 }
 
 type RequestQueryResult = {
@@ -261,6 +264,7 @@ const COLUMNS: Column[] = [
   { key: 'retry', label: t('重试'), sel: '.req-retry', track: '52px' },
   { key: 'status', label: t('状态'), sel: '.req-status', track: '96px' },
   { key: 'model', label: t('模型'), sel: '.req-model', track: 'minmax(0, 1.3fr)' },
+  { key: 'client', label: t('客户端'), sel: '.req-client', track: '110px' },
   { key: 'dur', label: t('用时'), sel: '.req-dur', track: '96px', align: 'right' },
   { key: 'usage', label: t('用量'), sel: '.req-usage', track: 'minmax(0, 1.6fr)' },
   { key: 'error', label: t('错误'), sel: '.req-error-cell', track: 'minmax(0, 1.2fr)' },
@@ -484,6 +488,40 @@ function formatDuration(ms: unknown): string {
 }
 
 /**
+ * 生成速度（tok/s）的悬停说明：口径与回落规则都在这里说清 —— 显示出来的数可能
+ * 按流式段算、也可能按总用时算（回落），不说明白会让人拿它对不上别的工具。
+ */
+const SPEED_TIP = t('生成速度：输出 token ÷ 流式段用时（总用时 − 首响）；流式段不足总用时一半时按总用时计')
+
+/** 流式段的下界（毫秒）：低于它按总用时计，见 tokensPerSecond */
+const STREAM_MS_FLOOR = 500
+
+/**
+ * 生成速度（tok/s）：输出 token ÷ 流式段用时（总用时 − 首响）。
+ *
+ * 分母刻意**不含**「等首帧」的时间 —— 那段若是模型的静默思考（首帧前上游一字节
+ * 不发），算进去会把生成速度压得明显偏低。但反过来，流式段只是一条**短尾巴**时
+ * 也不能按它算：思考型上游常常整段思考都不发帧，token 在首帧后的一个小窗口里
+ * 一股脑到达（上游缓冲、聚合路径、隐藏思考都是这个形态），486 token ÷ 0.6 秒
+ * 窗口能算出 800+ tok/s 的假速度 —— 那测的是「下发得快」，不是「生成得快」。
+ * 所以护栏两条，不满足就回落按总用时计（宁可给保守的平均速度，不给天文数字）：
+ *   · 流式段 ≥ STREAM_MS_FLOOR（非流式响应 duration ≈ 首响，分母趋零）；
+ *   · 流式段 ≥ 总用时的一半（内容段要撑得起请求，短尾窗口的读数不可信）。
+ * 输出 / 总用时为 0（失败行 token 清零、旧行）→ 空串，调用方整行省掉。
+ * 进行中行没有 completionTokens（收尾才记账），自然走空串 —— 速度只有终态行才有。
+ */
+function tokensPerSecond(entry: RequestEntry): string {
+  const tokens = Number(entry.completionTokens) || 0
+  const duration = Number(entry.durationMs) || 0
+  if (tokens <= 0 || duration <= 0) return ''
+  const first = Number(entry.firstResponseMs)
+  const streamMs = Number.isFinite(first) && first > 0 && first < duration ? duration - first : 0
+  const streaming = streamMs >= STREAM_MS_FLOOR && streamMs * 2 >= duration
+  const rate = tokens / ((streaming ? streamMs : duration) / 1000)
+  return `${rate >= 100 ? Math.round(rate) : rate.toFixed(1)} tok/s`
+}
+
+/**
  * 首响：上游首帧到达相对请求开始的耗时（OmniProxy 的 ttfb 同义）。null（旧数据没有该字段 /
  * 请求在首帧之前就失败）显示「-」—— 走 formatDuration 会把 null 算成 0ms，假数字比空占位更糟。
  */
@@ -549,9 +587,9 @@ function countRetries(entry: RequestEntry): number {
   }, 0)
 }
 
-/** 提供商展示名：providers.js 目录 → 原样回显 id（行内那一列还优先用后端给的 providerLabel） */
+/** 提供商展示名：providers.js 目录（注册名）→ 查词典 → 原样回显 id（行内那一列还优先用后端给的 providerLabel） */
 function providerLabelOf(id: string): string {
-  return shared().wbProviders?.labelOf?.(id) || id
+  return t(shared().wbProviders?.labelOf?.(id) || id)
 }
 
 /** 行 key 的去重：ts 在同一毫秒可能重复（并发请求），重复的补一个序号后缀，避免 React 报重复 key */
@@ -583,7 +621,7 @@ async function refreshFilterOptions(): Promise<void> {
   try {
     const filters = await shared().workbuddyDesktop?.getStatsRequestFilters()
     const providers: ProviderOption[] = (Array.isArray(filters?.providers) ? filters.providers : [])
-      .map(item => ({ value: String(item?.id || ''), label: String(item?.label || item?.id || '') }))
+      .map(item => ({ value: String(item?.id || ''), label: t(String(item?.label || item?.id || '')) }))
       .filter(item => item.value)
     const models: string[] = (Array.isArray(filters?.models) ? filters.models : [])
       .map(name => String(name || ''))
@@ -734,7 +772,8 @@ function requestCell(entry: RequestEntry, column: VisibleColumn): React.ReactNod
     case 'target': {
       const id = String(entry.provider ?? '').trim()
       const fromBackend = String(entry.providerLabel ?? '').trim()
-      const provider = fromBackend || (id ? providerLabelOf(id) : '')
+      // 后端给的是注册名（「WorkBuddy 国内版」这类），与目录侧一样要过一遍词典
+      const provider = fromBackend ? t(fromBackend) : (id ? providerLabelOf(id) : '')
       // 账号为空 = 请求在选定账号之前就失败了（后端契约：无账号时给空串），显式给破折号而不是留空
       return (
         <span key={key} className={className}>
@@ -864,6 +903,28 @@ function requestCell(entry: RequestEntry, column: VisibleColumn): React.ReactNod
       )
     }
 
+    case 'client': {
+      // 后端存的是**归类结果**（Codex / ZCode / Claude Code / …，见 core::client），
+      // 空串 = 没有记录（旧行、模型测试、请求未带 UA）。产品名是标识符不翻译，
+      // 只有兜底类 `other` 翻成「其它」；空值给占位符而不是空格子。
+      const value = String(entry.client ?? '').trim()
+      if (!value) {
+        return (
+          <span key={key} className={`${className} is-empty`}
+            title={t('这条明细没有记录来源客户端（旧数据、模型测试，或请求未带 User-Agent）')}>—</span>
+        )
+      }
+      const label = value === 'other' ? t('其它') : value
+      return (
+        <span key={key} className={className}
+          title={value === 'other'
+            ? t('识别到 User-Agent，但不属于已知的客户端类型：{ua}', { ua: value })
+            : t('来源客户端：{client}', { client: label })}>
+          {label}
+        </span>
+      )
+    }
+
     case 'dur': {
       if (isRunning(entry)) {
         // 进行中行没有 durationMs（收尾才记账）：主行显示已用时（每拍轮询在走）
@@ -900,10 +961,18 @@ function requestCell(entry: RequestEntry, column: VisibleColumn): React.ReactNod
       const line2 = t('缓存读取: {cache} / 命中率: {rate}', {
         cache: formatTokens(entry.cacheReadTokens), rate: cacheRate(entry),
       })
+      // 生成速度跟在命中率后面（**同一行**，不另起一行）：速度是「token ÷ 时间」的
+      // 导出量，归在用量读数一族；只有成功行有 token（失败行清零），拿不到就不加。
+      // 整行 nowrap，超宽省略 —— 完整读数在 title 里（与该列既有手法同一套）
+      const speed = tokensPerSecond(entry)
+      const line2full = speed ? `${line2} · ${speed}` : line2
       return (
-        <span key={key} className={className} title={`${line1}\n${line2}`}>
+        <span key={key} className={className} title={[line1, line2full].filter(Boolean).join('\n')}>
           <span className='req-usage-line'>{line1}</span>
-          <span className='req-usage-line sub'>{line2}</span>
+          <span className='req-usage-line sub'>
+            {line2}
+            {speed ? <span title={SPEED_TIP}> · {speed}</span> : null}
+          </span>
         </span>
       )
     }
@@ -1046,7 +1115,7 @@ function RequestsPage() {
         loaded: true,
         error: '',
       }
-      // 明细被清空或被保留期裁掉后，停在第 5 页会看到一片空白：先把 offset 夹回最后一页
+      // 明细被清空后，停在第 5 页会看到一片空白：先把 offset 夹回最后一页
       const lastOffset = Math.max(0, (Math.ceil(next.matched / current.size) - 1) * current.size)
       if (current.offset > lastOffset) {
         applyOffset(lastOffset)
@@ -1264,7 +1333,7 @@ function RequestsPage() {
         {/* id 保留：app.js 的 renderTopbarStatus 按 id 镜像这枚徽标的文案与配色（data-tone 空串
             = 无修饰，与旧实现 renderBadge 只写 'badge' 等价） */}
         <Badge id='req-badge' variant='outline' data-tone=''>{badgeText + liveText}</Badge>
-        <span className='panel-sub'>{t('按时间倒序，保留期在设置页可调')}</span>
+        <span className='panel-sub'>{t('按时间倒序，全量保留')}</span>
         <div className='head-actions'>
           {/* 打开清理弹窗（request-clear-modal.tsx）：两种删除方式 + 预览统计 + 压缩数据库都在
               那边；本页只负责把当前筛选参数给它（见 clearParams） */}

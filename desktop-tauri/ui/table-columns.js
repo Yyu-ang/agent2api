@@ -1,5 +1,5 @@
-/* Agent2API · 模型管理 / 网关 Key / 请求日志，以及「获取模型」弹窗两张表的
-   列宽拖动与持久化 */
+/* Agent2API · 模型管理 / 网关 Key / 请求日志 / 签到记录，以及「获取模型」弹窗
+   两张表的列宽拖动与持久化 */
 /* global wbApp */
 
 /**
@@ -83,7 +83,7 @@
    *   表头后的 repaint 也算一路（幂等）。
    *
    * ── columnsOf：列设置与列宽的同源 ─────────────────────────────
-   * 四张表都接了列设置（能藏列、能换顺序），而列宽这一层有多处要按**当前可见列**
+   * 五张表都接了列设置（能藏列、能换顺序），而列宽这一层有多处要按**当前可见列**
    * 算：覆盖值落到哪个 <col>、轨道列表有几条、末列的把手该不该往里挪。各自的
    * columnsOf 从那张表的渲染模块取可见列，再用本登记的列对象对齐 —— 本登记是
    * 列宽（track / 默认宽度）的权威，列设置那头只管显隐与顺序，两者同一个答案。
@@ -111,6 +111,17 @@
       columns: ['name', 'key', 'time', 'state', 'act'].map(key => ({ key })),
       columnsOf: visibleColumnsOf(() => window.wbKeysPanel?.visibleColumns?.()),
     },
+    // 代理池（islands/proxies-page.tsx）：默认列宽写在 <col> 的类上（Tailwind 的
+    // w-[196px] 那组，见 proxies-columns.ts 的 COL_CLASS），所以这里不需要 track。
+    // root 用 .proxies-table 而不是 .models-table —— 那张表骨架被网关 Key / 模型
+    // 管理共用，只按骨架选会一次绑上三张表。
+    {
+      id: 'proxies',
+      mode: 'table',
+      root: 'table.proxies-table',
+      columns: ['pick', 'name', 'addr', 'state', 'test', 'act'].map(key => ({ key })),
+      columnsOf: visibleColumnsOf(() => window.wbProxiesPanel?.visibleColumns?.()),
+    },
     {
       id: 'requests',
       mode: 'grid',
@@ -125,6 +136,9 @@
         { key: 'retry', sel: '.req-retry', track: '52px' },
         { key: 'status', sel: '.req-status', track: '96px' },
         { key: 'model', sel: '.req-model', track: 'minmax(0, 1.3fr)' },
+        // 客户端（来源 UA 的归类，见后端 core::client）：同列的 track 与
+        // page-requests.css 的 grid-template-columns 默认值必须同步
+        { key: 'client', sel: '.req-client', track: '110px' },
         { key: 'dur', sel: '.req-dur', track: '96px' },
         { key: 'usage', sel: '.req-usage', track: 'minmax(0, 1.6fr)' },
         { key: 'error', sel: '.req-error-cell', track: 'minmax(0, 1.2fr)' },
@@ -138,8 +152,19 @@
        */
       columnsOf: visibleColumnsOf(() => window.wbRequestsPanel?.visibleColumns?.()),
     },
+    // 签到记录（islands/checkin-records-tab.tsx）：table 模式里唯一**动态表头**的一张 ——
+    // 它的表头与表体都由 React 按列设置现渲染（标签页切走即卸载重建，就地重排那一路
+    // 跟不过重建），所以没有 syncStaticHead 的份；列集合变化由渲染方重画后调 repaint。
+    // root 只在「签到记录」标签页打开时存在（首次进页靠 awaitRoot 等它出现）。
+    {
+      id: 'checkin-records',
+      mode: 'table',
+      root: '.page[data-page="checkin"] table.ck-records-table',
+      columns: ['time', 'account', 'provider', 'source', 'outcome', 'detail'].map(key => ({ key })),
+      columnsOf: visibleColumnsOf(() => window.wbCheckinRecords?.visibleColumns?.()),
+    },
     // 「获取模型」弹窗的表（islands/models-fetch-modal.tsx 动态创建，关闭即移除）。
-    // 两个形态各一张表、各存一份列宽：列集合不同（内置家六列 / 自定义家三列），
+    // 两个形态各一张表、各存一份列宽：列集合不同（内置家七列 / 自定义家三列），
     // 混用一份覆盖值会让「拖过的 provider 列宽」串到自定义家去（那边没有这列）。
     // 初始化时表还不存在（弹窗未开）→ 这三个函数都按「找不到 root」空转，
     // 真正的恢复 / 补把手 / 绑定发生在弹窗每次渲染后的 repaint（见下）。
@@ -147,7 +172,10 @@
       id: 'fetch-models',
       mode: 'table',
       root: '#fm-table-intl',
-      columns: ['provider', 'source', 'state', 'count', 'note', 'updated'].map(key => ({ key })),
+      // 末列 'op' 是逐行「获取 / 重新获取」那一列。必须登记：没登记的列不进
+      // min-width 记账、也补不上把手 —— 别的列被拖宽之后它会被一起挤扁，连那颗
+      // 按钮都放不下（登记了才有 56px 的兜底份额，见 tableMinWidthOf）。
+      columns: ['provider', 'source', 'state', 'count', 'note', 'updated', 'op'].map(key => ({ key })),
     },
     {
       id: 'fetch-models-custom',

@@ -72,6 +72,21 @@ type ProviderFeatures = {
    */
   usageDetail?: boolean
   /**
+   * 余额格的读数旁边要不要挂「积分明细」入口（逐份积分包：面额 / 已用 / 剩余 +
+   * 领取 → 到期）—— 已登记的有 WorkBuddy 两家、Trae、OfficeAce、AutoClaw 两家、
+   * ZCode 两家、Qoder 两家、Loomy、小浣熊。
+   *
+   * 与 `usageDetail` 的差别是**动不动排版**：那个会把这格换成「套餐徽标 + 读数
+   * 按钮」的整套两行形态（CodeArts 的余额是两台网关的加总，一行分不出权益差别，
+   * 所以值得换）；这些家的读数本身（单行读数的「可用 N」、主额度桶的套餐名 +
+   * 进度条 + 剩 x / 共 y）已经回答了用户最常问的那句，明细是**加一层**而不是
+   * 换一层 —— 换过去主额度桶那格会丢掉进度条。
+   *
+   * 判据同样按能力位而不是形状探测：后端 `credits[]` 是这些家（以及以后愿意
+   * 照这个行形状出数据的家）的**承诺** —— 点开一定有逐份读数，不是点开一个空框。
+   */
+  creditDetail?: boolean
+  /**
    * 这一家「并发上限」的默认值（>0 = 本家**没有**「不限」这一档）。
    * CodeArts 的 3 是上游硬顶（超过直接回 HTTP 400，且那是账号级冲突、不降级换号），
    * 所以那一家把 `0` 解释成「按默认 3」而不是「不做并发过滤」；后端同一口径写在两处
@@ -97,23 +112,35 @@ type ProviderFeatures = {
  * 用户才有「去配置」的入口。
  */
 const PROVIDER_FEATURES: Record<string, ProviderFeatures> = {
-  workbuddy: { usage: true, edition: true, identifier: 'uid', expiry: 'expiresAt' },
+  // `creditDetail: true` —— 余额格读数旁边挂「积分明细」：后端 `query_usage` 在既有
+  //   积分简报之外还出 `credits[]`（逐份积分包的面额 / 已用 / 剩余 / 领取 / 到期，
+  //   见 providers::workbuddy::adapter 的 query_usage）。两地区能力一致，
+  //   两项都要登记（漏一个那一家就掉进 GENERIC_FEATURES）。
+  //   enterprise 账号没有资源包、后端不挂 `credits`，界面按空数组自然退回原样。
+  workbuddy: { usage: true, creditDetail: true, edition: true, identifier: 'uid', expiry: 'expiresAt' },
   // WorkBuddy 国际版（拆家后的第二家，见 providers::workbuddy::region）：
   //   `edition: false` 是因为注册名「WorkBuddy 国际版」自带地区，再拼一次会
   //   得到「WorkBuddy 国际版 国际版」（`editionSuffix` 虽有「名字已含就不拼」
   //   的兜底，这里直接写 false 更清楚，与 `zcode-intl` 同款）。
-  'workbuddy-intl': { usage: true, edition: false, identifier: 'uid', expiry: 'expiresAt' },
-  raccoon: { usage: true, edition: false, identifier: 'userId', expiry: 'tokenExpiresAt' },
+  'workbuddy-intl': { usage: true, creditDetail: true, edition: false, identifier: 'uid', expiry: 'expiresAt' },
+  // `creditDetail: true` —— 四个钱包桶（每日积分 / 每月会员积分 / 奖励积分 /
+  //   充值积分）各一行：上游只给余额一个数，没有面额 / 已用 / 到期（缺的键不出），
+  //   明细比读数多的只是「钱在哪个桶里」。
+  raccoon: { usage: true, creditDetail: true, edition: false, identifier: 'userId', expiry: 'tokenExpiresAt' },
   catpaw: { usage: true, edition: false, identifier: 'uid', expiry: 'tokenExpiresAt' },
   // AutoClaw 两个地区能力完全一致，差别只在域名；两项都必须登记 —— 漏了哪一项，
   // 那一家就会掉进 GENERIC_FEATURES（症状：余额按钮消失、标识列显示成空）
-  autoclaw: { usage: true, edition: false, identifier: 'userId', expiry: 'tokenExpiresAt' },
-  'autoclaw-intl': { usage: true, edition: false, identifier: 'userId', expiry: 'tokenExpiresAt', emailAsName: true },
+  // `creditDetail: true` —— 逐钱包余额各一行，另加一条「即将过期」（上游给的是
+  //   相对时长文案，原样带出，不换算成时刻）。两个地区都要带上。
+  autoclaw: { usage: true, creditDetail: true, edition: false, identifier: 'userId', expiry: 'tokenExpiresAt' },
+  'autoclaw-intl': { usage: true, creditDetail: true, edition: false, identifier: 'userId', expiry: 'tokenExpiresAt', emailAsName: true },
   // Qoder 两个地区能力完全一致（拆家后是两家 provider，查表按 id 精确匹配，
   // 只登记一个会让国际版掉进 GENERIC_FEATURES）；`edition` 列仍在 —— 两家各是
   // 单一地区，但公开形态仍带 edition 供徽章显示
-  qoder: { usage: true, edition: true, identifier: 'userId', expiry: 'expiresAt', emailAsName: true },
-  'qoder-intl': { usage: true, edition: true, identifier: 'userId', expiry: 'expiresAt', emailAsName: true },
+  // `creditDetail: true` —— 三个桶各一行（套餐额度 / 个人资源包 / 组织资源包），
+  //   桶级口径、没有时刻；两个地区都要带上。
+  qoder: { usage: true, creditDetail: true, edition: true, identifier: 'userId', expiry: 'expiresAt', emailAsName: true },
+  'qoder-intl': { usage: true, creditDetail: true, edition: true, identifier: 'userId', expiry: 'expiresAt', emailAsName: true },
   // Cline 两条键：同一家上游按计费通道拆成两个 provider，账号形态完全一样（见
   // providers::cline::models）。查表按 id 精确匹配，只登记一个会让另一家掉进兜底
   'cline-free': { usage: true, edition: false, identifier: 'account', expiry: 'expiresAt' },
@@ -132,8 +159,11 @@ const PROVIDER_FEATURES: Record<string, ProviderFeatures> = {
   //   **每天一份新套餐**（plan_id 带日期段），领过之后按钮当天显示「今日已领」、
   //   次日自动恢复 —— 见 `claimedToday`。
   // expiry 取 expiresAt 是给 add_zcode_account 的契约（落账号时要写访问令牌的过期时间）
-  zcode: { usage: true, claim: true, planChannel: true, edition: true, identifier: 'userId', expiry: 'expiresAt' },
-  'zcode-intl': { usage: true, claim: true, planChannel: true, edition: true, identifier: 'userId', expiry: 'expiresAt' },
+  // `creditDetail: true` —— 逐额度桶一行（总量 / 已用 / 剩余，认得出归属时还带套餐名）；
+  //   纯比例窗口（监控通道那条链）只有 `remainingPercent`、三个数全缺，整行跳过
+  //   （见 zcode::balance 的 credits_of）—— 那一档和现在一样不出入口。两个地区都要登记。
+  zcode: { usage: true, creditDetail: true, claim: true, planChannel: true, edition: true, identifier: 'userId', expiry: 'expiresAt' },
+  'zcode-intl': { usage: true, creditDetail: true, claim: true, planChannel: true, edition: true, identifier: 'userId', expiry: 'expiresAt' },
   // CodeArts（华为云 AI 代码助手）。各位各有出处，别照着别家抄：
   // `usage: true` —— 余额是**两份账**（订阅统计 + 福利网关，见 providers::codearts::balance），
   //   界面上「读到 0」与「没读到」必须能分开，后端因此把失败的一侧写进 statisticsError /
@@ -155,14 +185,20 @@ const PROVIDER_FEATURES: Record<string, ProviderFeatures> = {
   // 而不是一个地区的两种拼法，国际版将来接入时另立 provider id，不把它做成账号字段。
   // `usage: true` 对应 providers::trae::usage（上游两份账：ide_user_ent_usage 的权益包/
   // 积分池 + ide_user_pay_status 的快请求与 SOLO 并发）。
-  trae: { usage: true, edition: false, identifier: 'uid', expiry: 'expiresAt' },
+  // `creditDetail: true` —— 同一份 ent_usage 里还读得到**逐份权益包**的
+  //   `start_time` / `expire_time`（领取 → 到期），后端摊成 `credits[]`
+  //   （见 providers::trae::usage 的 credit_rows）。签到发的包会按天堆起来，
+  //   哪一份先作废只有这份清单答得上来。
+  trae: { usage: true, creditDetail: true, edition: false, identifier: 'uid', expiry: 'expiresAt' },
   // Loomy（讯飞）。各位各有出处：
   // `usage: true` 对应 providers::loomy::balance —— 余额是**双账户**（永久积分 +
   //   每日赠送积分，读 `GET /api/v2/points/records` 的摘要字段），界面上两张卡都列。
   // `edition: false` —— 单一入口（手机验证码登录），没有国际版/地区概念。
   // `expiry: 'expiresAt'` —— 落账号时按登录时刻 + 14 天估算（上游没有续期接口，
   //   过期只能重新登录；这一列对它是「什么时候该重登」的提示）。
-  loomy: { usage: true, edition: false, identifier: 'userId', expiry: 'expiresAt' },
+  // `creditDetail: true` —— 双账户各一行（永久积分 / 每日赠送积分），后者标 `daily`
+  //   → 界面写「每日重置」而不是到期（读到 0 也不折进「已用完」，明天回满）。
+  loomy: { usage: true, creditDetail: true, edition: false, identifier: 'userId', expiry: 'expiresAt' },
   // KukuAI（百度文库库库 AI）。各位各有出处：
   // `usage: true` —— 余额/积分查询（GET /bizapi/gfpro/getgfvipremain 的
   //   totalPoint，见后端 providers::kuku::balance）。
@@ -184,7 +220,20 @@ const PROVIDER_FEATURES: Record<string, ProviderFeatures> = {
   // `identifier: 'id'` —— 账号标识渲染的是**账号 id**（`officeace-<hash>`，
   //   由网关基址 + app key 派生），不是任何凭据本身：面板上显示 `modelAppKey`
   //   会把网关 key 露在界面上（`identifierOf` 读的是字段**值**，不只是标签）。
-  officeace: { usage: true, edition: false, identifier: 'id', expiry: 'expiresAt' },
+  // `creditDetail: true` —— 逐条套餐配额 + 逐条奖励活动各一行（奖励活动含已过期的
+  //   —— 弹层把它与「已用完」一起收进末尾折叠组），另加一条联网搜索（单位「次」，
+  //   与文档级的「积分」不同）。
+  officeace: { usage: true, creditDetail: true, edition: false, identifier: 'id', expiry: 'expiresAt' },
+  // Antigravity（Google AI IDE）。各位各有出处：
+  // `usage: true` —— 额度是**两个模型组 × 两个窗口**（5 小时 / 每周）的剩余比例，
+  //   见后端 providers::antigravity::balance（retrieveUserQuotaSummary）；
+  //   上游只给比例、没有绝对数，钱包行走纯比例读数（`remainingPercent` +
+  //   `balanceView`），余额列显示「最紧张的窗口」，悬停列出全部窗口与重置时刻。
+  // `edition: false` —— 单一入口（Google OAuth 粘贴 / 网页登录），没有地区概念。
+  // `identifier: 'userId'` —— 身份键存的就是 email（见 account_store::antigravity_accounts 模块头）。
+  // `expiry: ''` —— refresh token 不过期、access token 自动续期，这一列对它没有可显示的事实
+  //   （与 kuku 同一处置：界面不渲染「有效期」）。
+  antigravity: { usage: true, edition: false, identifier: 'userId', expiry: '' },
 }
 
 /**
@@ -205,6 +254,68 @@ export function providerOf(account: AccountRecord | null | undefined): string {
 /** provider id → 能力表（未登记的家走 GENERIC_FEATURES） */
 export function providerFeatures(providerId: string | undefined): ProviderFeatures {
   return (providerId && PROVIDER_FEATURES[providerId]) || GENERIC_FEATURES
+}
+
+/* ─── OpenCode Zen 判定（出网「轮询」档的唯一开放对象）─────────── */
+
+/**
+ * 客户端形态伪装开关的合法值（与后端 `custom_providers::CLIENT_EMULATION_OPENCODE`
+ * 逐字一致）。开着它就说明这一家按 OpenCode 官方 CLI 的形状补齐出站请求 ——
+ * 也就是免费档那一套（预置卡「OpenCode Zen」默认开启）。
+ */
+const CLIENT_EMULATION_OPENCODE = 'opencode'
+
+/** OpenCode **Go**（订阅制）的端点：与免费档同域不同档，见后端 `is_opencode_go_endpoint` */
+const OPENCODE_GO_BASE_URL = 'https://opencode.ai/zen/go/v1'
+
+/**
+ * 这条（提供商, 账号）组合是不是 **OpenCode Zen 免费档** —— 出网「轮询」档在
+ * 界面上唯一出现的对象。判据与后端 `custom_providers::is_opencode_zen_account`
+ * 逐条对应（两处必须同口径，否则会出现「界面给了这个档、保存却被 400 挡下」）：
+ *
+ *   1. 提供商记录开着客户端形态伪装（`clientEmulation === 'opencode'`）——
+ *      免费档按 IP 限流、429 只管这个 IP 的额度，轮换出口才有意义；
+ *   2. 最终 baseUrl 不是 Go 面端点。账号的覆盖项优先于提供商记录（与转发侧
+ *      解析最终地址同序），两层都要过。
+ */
+export function isOpencodeZenProvider(
+  provider: { baseUrl?: string; clientEmulation?: string } | null | undefined,
+  accountBaseUrl?: string,
+): boolean {
+  if (!provider || provider.clientEmulation !== CLIENT_EMULATION_OPENCODE) return false
+  const override = typeof accountBaseUrl === 'string' ? accountBaseUrl.trim() : ''
+  const base = (override || String(provider.baseUrl || '')).trim().replace(/\/+$/, '').toLowerCase()
+  if (!base) return false
+  return base !== OPENCODE_GO_BASE_URL
+}
+
+/**
+ * 按账号查出它所属的**自定义提供商记录**（目录缓存是唯一同步数据源；
+ * 内置家 / 目录里查不到时给 null）。
+ *
+ * 目录（`wbProviders.customList`）由 providers.js 统一拉取与缓存，条目就是
+ * 后端记录本身（含 `clientEmulation` / `baseUrl`）—— 与账号设置弹窗用
+ * `wbCustomProvidersUi.find` 取到的是同一份数据，只是这里同步读缓存。
+ */
+export function customProviderOf(
+  account: AccountRecord | null | undefined,
+): { baseUrl?: string; clientEmulation?: string } | null {
+  const id = account ? providerOf(account) : ''
+  if (!id.startsWith('custom-')) return null
+  const list = shared().wbProviders?.customList?.() || []
+  return list.find(item => item?.id === id) || null
+}
+
+/**
+ * 这条账号能不能用出网「轮询」档（弹窗与批量弹窗共用的唯一判据）。
+ *
+ * 一次读两处：账号自己的 baseUrl 覆盖项 + 目录里那家提供商记录。
+ * 缓存里还没有这一家（首屏还没拉到目录）时判定为 false —— 「档位晚一轮出现」
+ * 比「点开一个保存必然 400 的档」轻。
+ */
+export function supportsProxyRotate(account: AccountRecord | null | undefined): boolean {
+  if (!account) return false
+  return isOpencodeZenProvider(customProviderOf(account), account.baseUrl)
 }
 
 /**
@@ -277,9 +388,22 @@ export function tokenExpiryOf(account: AccountRecord | null | undefined): number
   return expiryMillis(account?.[key])
 }
 
-/** 该账号所属 provider 是否有余额概念（没有就不渲染余额按钮，也不参与批量查询） */
+/**
+ * 该账号所属 provider 是否有余额概念（没有就不渲染余额按钮，也不参与批量查询）。
+ *
+ * 内置家走能力表（`usage` 位）；**自定义家（含「预置 API」卡片建的那些）不走表**
+ * —— 它们的能力来自**提供商记录里的余额方案**，由后端注入成账号公开形态上的
+ * `balanceQuery.scheme`（六种方案见 `providers::custom::balance` 与
+ * `balance-query.tsx`）：有方案 = 能查余额。
+ *
+ * 「有方案但凭证没配」**照样算有**：后端那次查询回的是「未配置」的中性提示
+ * （不是红色失败），按钮与「查询设置」段都得在，用户才有地方去补 —— 与
+ * CatPaw / ZCode 的「未配置也给入口」同一取舍。
+ */
 export function supportsUsage(account: AccountRecord | null | undefined): boolean {
-  return providerFeatures(providerOf(account)).usage
+  const provider = providerOf(account)
+  if (provider.startsWith('custom-')) return Boolean(account?.balanceQuery?.scheme)
+  return providerFeatures(provider).usage
 }
 
 /* ─── 每账号的余额查询设置（账号设置弹窗「查询设置」段共用）─── */
@@ -674,11 +798,13 @@ export function zcodePlanOf(account: AccountRecord | null | undefined): string {
 /**
  * 通道的展示名（与后端 `zcode::plan_label` 同一套措辞）。
  *
- * 后端保存成功后会回一句「套餐通道 → 活动套餐（Start Plan）」，两处措辞若
+ * 后端保存成功后会回一句「套餐通道 → 套餐池（Start Plan）」，两处措辞若
  * 不一致，用户会以为设置里选的与提示里说的不是同一件事。
+ * Start Plan 叫「套餐池」而不是早期的「活动套餐」：池子里除了活动领取的额度，
+ * 还有新注册用户的免费体验额度（issue #134 / #232 的用户都在这一档）。
  */
 export function zcodePlanLabel(plan: string | undefined): string {
-  return plan === ZCODE_PLAN_START ? t('活动套餐（Start Plan）') : t('编码套餐（Coding Plan）')
+  return plan === ZCODE_PLAN_START ? t('套餐池（Start Plan）') : t('编码套餐（Coding Plan）')
 }
 
 /**
@@ -742,6 +868,16 @@ export function claimDoneTitle(account: AccountRecord | null | undefined): strin
  */
 export function supportsUsageDetail(account: AccountRecord | null | undefined): boolean {
   return Boolean(providerFeatures(providerOf(account)).usageDetail)
+}
+
+/**
+ * 余额格的读数旁边要不要挂「积分明细」入口（见 ProviderFeatures.creditDetail）。
+ *
+ * 与 `supportsUsageDetail` 是两件事：那个是**整套两行形态**（会替掉读数本来的
+ * 排版），这个是**只加一个入口**（读数末尾的小箭头）。所以判据也不能共用。
+ */
+export function supportsCreditDetail(account: AccountRecord | null | undefined): boolean {
+  return Boolean(providerFeatures(providerOf(account)).creditDetail)
 }
 
 /**
@@ -838,12 +974,13 @@ export function welfareTodoTitle(state: WelfareState): string {
   return t('{tried}探测并领取官方每日登录赠送的套餐积分（到账进套餐积分，不增加福利模型 token 池）', { tried })
 }
 
-/* ─── 筛选维度（enabled / limit / q 三维各自独立）─────────────
-   分组模式（账号页按家分组）去掉了「提供商」这一维：家的维度已经由页面结构本身
-   表达（一家一段），再挂一个下拉筛同一件事，只会让「现在看的是哪几家」有两个说法。
-   `q` 是搜索框（账号名 / 备注 / 邮箱 / 标识），与另外两维共用同一条可见性口径。 */
+/* ─── 筛选维度（provider / enabled / limit / q 四维各自独立）───
+   `provider` 是工具条最前那颗下拉（'all' = 不限）：分组之后「哪一家」虽然由页面
+   结构本身表达，但「只看某一家」仍是常用动作 —— 分组带收起得掉一家，却收不掉
+   其余那几家；账号多了之后，把别家整体请出视野正是筛选该干的事。
+   `q` 是搜索框（账号名 / 备注 / 邮箱 / 标识），与另外三维共用同一条可见性口径。 */
 
-export type AccountFilter = { enabled: string; limit: string; q: string }
+export type AccountFilter = { provider: string; enabled: string; limit: string; q: string }
 
 /** 余额读数的查找口（账号 → `usageEntryOf` 的结果）；不传视作「都没有读数」 */
 export type UsageLookup = (account: AccountRecord) => UsageEntry | undefined
@@ -888,6 +1025,12 @@ export function matchQuery(account: AccountRecord, filter: AccountFilter): boole
   return haystack.some(value => String(value || '').toLowerCase().includes(q))
 }
 
+/** 提供商维度：'all' 不限；其余按 provider id 精确相等（与 `providerOf` 同一口径 ——
+ *  字段缺失的老记录归默认家，不会因为筛选而漏掉） */
+export function matchProvider(account: AccountRecord, filter: AccountFilter): boolean {
+  return filter.provider === 'all' || providerOf(account) === filter.provider
+}
+
 export function matchEnabled(account: AccountRecord, filter: AccountFilter): boolean {
   if (filter.enabled === 'all') return true
   return filter.enabled === 'enabled' ? isEnabled(account) : !isEnabled(account)
@@ -906,19 +1049,20 @@ export function matchLimit(
   return filter.limit === 'limited' ? limited : !limited
 }
 
-/** 单条账号是否通过当前筛选（三个维度的合取）。`visibleAccounts` 就是它在列表上的 filter */
+/** 单条账号是否通过当前筛选（四个维度的合取）。`visibleAccounts` 就是它在列表上的 filter */
 export function matchesFilter(
   account: AccountRecord,
   filter: AccountFilter,
   usageOf?: UsageLookup,
   tokenUsageOf?: TokenUsageLookup,
 ): boolean {
-  return matchEnabled(account, filter)
+  return matchProvider(account, filter)
+    && matchEnabled(account, filter)
     && matchLimit(account, filter, usageOf, tokenUsageOf)
     && matchQuery(account, filter)
 }
 
-/** 当前筛选条件下的可见账号（三个维度同时生效） */
+/** 当前筛选条件下的可见账号（四个维度同时生效） */
 export function visibleAccounts(
   all: AccountRecord[] | null | undefined,
   filter: AccountFilter,
@@ -929,8 +1073,14 @@ export function visibleAccounts(
 }
 
 /**
- * 分段计数：某分段显示的数字 = 「其余维度保持当前选择、本维度取该值」的账号数。
- * 「可见列表」与「分段计数」共用这一份口径 —— 否则徽标数字与点进去看到的结果会各算各的。
+ * 分段计数：状态与限额按「两级筛选」各管一段 ——
+ *   · 状态段的数字 = 全量（提供商 + 搜索取景后），不受限额档位影响：状态是
+ *     一级筛选，它要回答「现在一共有多少账号」，数字必须恒定；
+ *   · 限额段的数字 = 状态收窄后的范围（提供商 + 搜索 + 状态档），再按
+ *     正常 / 已限流分档：限额是二级筛选，它数的是「这一级里还有多少」。
+ * 徽标与点进去看到的行数仍然一致（状态段在限额=全部时所见即徽标；限额段
+ * 在当前状态档下所见即徽标），而「全部」恒等于家底总数，切限额不再让状态
+ * 的数字跟着变。
  */
 export function filterCounts(
   all: AccountRecord[] | null | undefined,
@@ -940,8 +1090,8 @@ export function filterCounts(
 ): Record<string, number> {
   const list = all || []
   const scope = (except: 'enabled' | 'limit') => list.filter(account =>
-    (except === 'enabled' || matchEnabled(account, filter))
-    && (except === 'limit' || matchLimit(account, filter, usageOf, tokenUsageOf))
+    matchProvider(account, filter)
+    && (except === 'enabled' || matchEnabled(account, filter))
     && matchQuery(account, filter))
 
   const forEnabled = scope('enabled')
@@ -1160,13 +1310,14 @@ export function accountTags(account: AccountRecord): AccountTag[] {
         title: t('{error}（转发时会回退直连）', { error: account.proxy.error }),
       }
       : null,
-    // 走活动套餐通道时标出来：它不是默认值，而「这条请求到底花的是哪份额度」
-    // 恰恰是用户在这个页面上要回答的问题（行上的余额列也可能同时挂着两份）
+    // 走套餐池（Start Plan）通道时标出来：它不是默认值，而「这条请求到底花的
+    // 是哪份额度」恰恰是用户在这个页面上要回答的问题（行上的余额列也可能同时
+    // 挂着两份）
     zcodePlanOf(account) === ZCODE_PLAN_START
       ? {
-        text: t('活动套餐'),
+        text: t('套餐池'),
         kind: 'plain' as const,
-        title: t('转发走活动套餐通道（zcode.z.ai 的 Anthropic 端点，用账号里领到的额度）；在账号设置里可切回编码套餐'),
+        title: t('转发走套餐池（Start Plan）通道（zcode.z.ai 的 Anthropic 端点，用账号里的体验额度 / 活动领取额度）；在账号设置里可切回编码套餐'),
       }
       : null,
   ].filter((tag): tag is AccountTag => tag !== null)

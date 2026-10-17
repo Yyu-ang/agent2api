@@ -47,6 +47,7 @@ use serde_json::Value;
 use crate::server::core::account_store::AccountStore;
 use crate::server::core::auth::{is_token_expiring, AuthService};
 use crate::server::core::models::global_catalog;
+use crate::server::core::upstream::request::{new_conversation_id, new_message_id, new_span_id};
 use crate::server::errors::GatewayError;
 
 use super::super::adapter::{
@@ -171,12 +172,7 @@ impl ProviderAdapter for WorkBuddyAdapter {
             None => normalized,
         };
         let url = chat_completions_url(session, self.region);
-        let headers = chat_headers(
-            session,
-            self.region,
-            &crate::server::core::upstream::request::new_request_id(),
-            Some("text/event-stream"),
-        );
+        let headers = chat_headers(session, self.region, Some("text/event-stream"));
         Ok(ChatRequestPlan::chat(url, headers, with_system))
     }
 
@@ -533,24 +529,36 @@ impl ProviderAdapter for WorkBuddyAdapter {
         true
     }
 
-    /// 查积分简报 —— **转调既有计费服务，形状一个字不改**。
+    /// 查积分简报（**既有五键逐字保留**）+ 逐份积分包明细。
     ///
-    /// ── 为什么形状不归一化（这是硬要求）─────────────────────────
-    /// `query_credits_summary` 返回的
+    /// ── 为什么既有形状不归一化（这是硬要求）─────────────────────
     /// `{kind, unlimited, totalLeft, planLeft, bonusLeft}` 是改造前就有的既有契约，
-    /// 前端一直按它渲染（余额列的读数，见 `ui/accounts-table.js` 的 `usageSummary`）。
+    /// 前端一直按它渲染（余额列的读数，见 `ui/accounts-table.js` 的 `usageSummary`，
+    /// 后端 `usage_records::extract_remaining` 也认 `totalLeft` 这一个键）。
     /// 把它包装成 trait 文档里那套 `{available, unit, wallets, subscription}`
-    /// 会让那一格的显示退化 —— 那是明令禁止的。四家的形状在
-    /// `query_usage` 的文档里写清楚了：新移植的两家走统一形状，本家保持原样，
-    /// 前端按字段探测两套形状（`totalLeft` 键就是本家形状的判别键）。
+    /// 会让那一格的显示退化 —— 那是明令禁止的。所以这里是**加**不是换：
+    /// 五个既有键由 `billing::credits_summary_from` 原样产出（与
+    /// `query_credits_summary` 同一份逻辑），新挂上去的只有两项：
+    ///
+    ///   * `credits[]`      —— 逐份积分包明细（面额 / 已用 / 剩余 / 领取 / 到期），
+    ///                        账号页的「积分明细」弹层读它（能力位 `creditDetail`）；
+    ///   * `subscription`   —— 当前生效套餐的名字与到期时刻，弹层头部那一行。
+    ///
+    /// 成长在一处、退化在另一处才叫「不改形状」：既有键一个不动、读数与悬停提示
+    /// 逐字不变，新增的两个键只有弹层在读。
+    ///
+    /// ── 为什么是 `query_usage` 而不是 `query_credits_summary` ─────
+    /// 后者只回三个数（它内部那次查询的 `resources` 被丢掉了）。这里要明细，
+    /// 就得拿查询的完整成果；两个都调会让**同一个上游接口被打两次**
+    /// （批量查询时按账号翻倍）。所以调 `query_usage` 一次，再用
+    /// `credits_summary_from` 摊出那份简报 —— 与改造前的响应逐字相同。
     ///
     /// ── 与 `api::accounts` 里那条老路径的关系 ────────────────────
     /// 这里构造的 `BillingService::new(AuthService::for_store(store.clone()))`
     /// 与 `ServerState::billing()` **是同一个东西**：后者是
     /// `BillingService::new(AuthService::new(store, default_context()))`，
     /// 而 `AuthService::for_store` 用的也是 `default_context()`
-    /// （见 `core::auth::AuthService::for_store`）。因此接口层可以统一走适配器，
-    /// 拿到的结果与改造前逐字相同 —— 不必按 provider 在接口层再分一条老路径。
+    /// （见 `core::auth::AuthService::for_store`）。因此接口层可以统一走适配器。
     ///
     /// `session` 传 `None` 会让计费服务回落到 `auth.get_current_session()`
     /// （那是「当前账号」的语义）。这里必须传**指定账号**的会话：
@@ -572,12 +580,78 @@ impl ProviderAdapter for WorkBuddyAdapter {
             let billing = crate::server::core::billing::BillingService::new(
                 AuthService::for_store(store.clone()),
             );
-            billing
-                .query_credits_summary(Some(&entry.session), None)
+            let usage = billing
+                .query_usage(Some(&entry.session), None)
                 .await
-                .map_err(|error| error.to_gateway_error())
+                .map_err(|error| error.to_gateway_error())?;
+            let mut document = crate::server::core::billing::credits_summary_from(&usage);
+            let Some(object) = document.as_object_mut() else {
+                return Ok(document);
+            };
+            // 企业账号没有资源包（那份额度是「本周期已用 / 上限」一笔账，
+            // 见 `get_enterprise_usage`）：明细与套餐两项都不挂，界面退回单行读数
+            let packs = crate::server::core::billing::credit_packs_from(&usage);
+            if !packs.is_empty() {
+                object.insert("credits".to_string(), Value::Array(packs));
+            }
+            if let Some(subscription) = subscription_of(&usage) {
+                object.insert("subscription".to_string(), subscription);
+            }
+            Ok(document)
         })
     }
+}
+
+/// `get_personal_usage` 的成果 → 统一契约里的 `subscription`（账号页弹层头部那一行）。
+///
+/// ── `planName` 为什么要分档改写 ──────────────────────────────
+/// 前端的套餐徽标按**上游原始名**分流（`isFreePlan` 只认 `^free$`、
+/// `planBadgeLabel` 只认 `^trial$` —— ZCode 现网就给的这两个词），而本家的
+/// `planName` 是积分包的**上游名**（`PackageName`，如「CodeBuddy个人体验版」；
+/// 国际版给的是英文名「Bonus Pack」这类），照直传进去会让
+/// **免费账号徽标走付费样式**、而且名字长到一行放不下。所以这里按
+/// `editionType` 把两档免费/试用的名字归一成 ZCode 那两个词，其余（专业版 /
+/// 进阶版 / 旗舰版 / 青春版）保留上游包名 —— 那几档正是用户要一眼看见的。
+///
+/// 企业账号（`kind: enterprise`）返回 `None`：那份读数没有套餐名，也没有
+/// 会到期的包，编一个套餐名出去比空着更容易被读错。
+fn subscription_of(usage: &Value) -> Option<Value> {
+    if usage.get("kind").and_then(Value::as_str) == Some("enterprise") {
+        return None;
+    }
+    let edition = usage.get("editionType").and_then(Value::as_str).unwrap_or("free");
+    let plan_name = match edition {
+        "free" => "Free".to_string(),
+        "pro_trial" => "Trial".to_string(),
+        _ => usage.get("planName").and_then(Value::as_str).unwrap_or("").trim().to_string(),
+    };
+    if plan_name.is_empty() {
+        return None;
+    }
+    let mut subscription = serde_json::Map::new();
+    subscription.insert("planName".to_string(), Value::String(plan_name));
+    subscription.insert(
+        "status".to_string(),
+        Value::String(
+            match edition {
+                "free" => "免费",
+                "pro_trial" => "试用",
+                _ => "付费",
+            }
+            .to_string(),
+        ),
+    );
+    // 三个可选数值：`usageLeft` / `usageTotal` 上游给的是**字符串**（Node 版
+    // `String(...)`），这里原样带出去 —— 前端 `subscriptionText` 本来就是
+    // `Number(...)` 读的（见 accounts-panels.tsx），两份形状不必统一成数字。
+    for (from, to) in [("expireAt", "expireAt"), ("usageLeft", "remainQuota"), ("usageTotal", "totalQuota")] {
+        if let Some(value) = usage.get(from) {
+            if !value.is_null() {
+                subscription.insert(to.to_string(), value.clone());
+            }
+        }
+    }
+    Some(Value::Object(subscription))
 }
 
 /// 本地区默认登录态的 access token（环境变量优先，其次账号存储派生的当前账号）。
@@ -609,13 +683,32 @@ async fn default_session_token(store: &AccountStore, region: Region) -> Result<S
     }
 }
 
-// ─── 头集合与 URL（从 upstream/request.rs 搬入，语义逐字保持）──────
+// ─── 头集合与 URL ───────────────────────────────────────────
+// （最初从 upstream/request.rs 搬入；会话头族按 5.8.4 抓包升级，见 chat_headers）
 
-/// 客户端身份 + 鉴权 + 会话追踪头（对照 Node 的 buildHeaders）。
+/// 客户端身份 + 鉴权 + 会话追踪头。
 ///
-/// `request_id` 同时充当 X-Request-ID / X-Conversation-Request-ID /
-/// X-Conversation-ID / X-Session-ID —— Node 在没有 conversationId 时就是
-/// 这四者取同一个值（追踪一轮对话用）。
+/// ── 会话头族与身份对齐（2026-10 升级，渠道校验 11-128）────────
+/// 国际版上游上线了「渠道校验」：对话请求缺会话头族（`X-Conversation-ID` /
+/// `-Request-ID` / `-Message-ID` / `-Root-Request-ID`）时回 400 / code 11-128
+/// （`conversation id missing`，displayTips「这次调用没通过渠道校验，可能不是
+/// 官方客户端发出的」）。取值形态按 2026-10-16 对国际版客户端 5.8.4 的
+/// mitmproxy 抓包对齐（参考实现 workbuddy2api-hub #381，两仓同步升级）：
+///
+/// - 会话 / 消息 id **每次请求现生成**：会话 id 是带连字符的 UUID，请求 /
+///   消息 id 是 32 位无连字符 hex（UUIDv7 家族）。上游不拿这些 id 存对话
+///   历史（同一 id 连发两轮、第二轮只带 system+user，模型仍答不出上一轮），
+///   也不做跨请求关联，补的是「有」而不是「稳定」—— 见
+///   `upstream::request::{new_conversation_id, new_message_id}`。
+/// - `X-Conversation-Request-ID` 与 `X-Root-Request-ID` 是同一个值：官方在
+///   一次 user send 开始时生成、该轮所有请求复用。
+/// - 链路头族（`X-Trace-ID` / `traceparent` / `b3` / `X-B3-*`）照抓包补齐；
+///   主请求的 `X-B3-ParentSpanId` 需要真实父子调用关系，不伪造。
+/// - `X-Product` 是产品族 `SaaS`（实测值），不是产品名；`X-IDE-Name` 与
+///   `X-IDE-Type` 同为 `WorkBuddy`。版本号与 UA 走 `edition.chat_ide_version`
+///   / `edition.chat_ua`（国际版 5.8.4 实测值，计费 / 登录链路不受影响）。
+/// - **不再发 `X-Session-ID`**：官方对话请求不带它（只用于反馈上报），此前
+///   发的恒定派生值本身就是一处网关特征。
 ///
 /// ── 客户端身份按 `region` 取（拆家后的口径）────────────────────
 /// 改造前这里读的是 `session.edition`（账号上的字段）。拆家后**provider id
@@ -629,30 +722,72 @@ async fn default_session_token(store: &AccountStore, region: Region) -> Result<S
 pub(super) fn chat_headers(
     session: &Value,
     region: Region,
-    request_id: &str,
     accept: Option<&str>,
 ) -> Vec<(String, String)> {
     let edition = region.edition();
+    let conversation_id = new_conversation_id();
+    let message_id = new_message_id();
+    let conversation_request_id = new_message_id();
+    let trace_id = new_message_id();
+    let span_id = new_span_id();
+    // Origin / Referer 跟着会话生效端点走（staging / 自建反代账号的落点），
+    // 与 `chat_completions_url` 共用同一份解析规则。
+    let origin = session_endpoint(session, region);
+    let authority = origin
+        .split_once("://")
+        .map(|(_, rest)| rest.to_string())
+        .unwrap_or_else(|| origin.clone());
+    let accept_language = match region {
+        Region::Intl => "en-US",
+        Region::Cn => "zh-CN",
+    };
     let mut headers: Vec<(String, String)> = vec![
         ("Content-Type".to_string(), "application/json".to_string()),
-        // 完整三段 UA（含 CLI 扩展段）：与桌面客户端一致，服务端按此识别通道
+        // 对话链路专用 UA（国际版 5.8.4 实测；完整三段含 CLI 扩展段）
         (
             "User-Agent".to_string(),
-            crate::server::core::endpoints::user_agent_for_edition(Some(edition.id)),
+            edition.chat_ua.to_string(),
         ),
         // 客户端身份头：服务端按此做客户端识别与白名单校验
         ("X-IDE-Type".to_string(), edition.ua_platform.to_string()),
-        ("X-IDE-Name".to_string(), edition.product_name.to_string()),
-        ("X-IDE-Version".to_string(), edition.client_version.to_string()),
-        ("X-Product".to_string(), edition.product_name.to_string()),
+        ("X-IDE-Name".to_string(), edition.ua_platform.to_string()),
+        ("X-IDE-Version".to_string(), edition.chat_ide_version.to_string()),
+        ("X-Product".to_string(), "SaaS".to_string()),
         ("X-Agent-Intent".to_string(), "craft".to_string()),
-        // 会话追踪
-        ("X-Request-ID".to_string(), request_id.to_string()),
-        ("X-Conversation-Request-ID".to_string(), request_id.to_string()),
-        ("X-Conversation-ID".to_string(), request_id.to_string()),
-        ("X-Session-ID".to_string(), request_id.to_string()),
+        ("X-Agent-Purpose".to_string(), "conversation".to_string()),
+        ("X-Agent-Type".to_string(), "main".to_string()),
+        ("X-Private-Data".to_string(), "true".to_string()),
+        // 会话头族（渠道校验的判据，见函数头）
+        ("X-Conversation-ID".to_string(), conversation_id),
+        (
+            "X-Conversation-Request-ID".to_string(),
+            conversation_request_id.clone(),
+        ),
+        ("X-Root-Request-ID".to_string(), conversation_request_id),
+        ("X-Conversation-Message-ID".to_string(), message_id.clone()),
+        ("X-Request-ID".to_string(), message_id),
+        // 链路头族（5.8.4 对话请求随带的观测头）
+        ("X-Trace-ID".to_string(), trace_id.clone()),
+        ("traceparent".to_string(), format!("00-{trace_id}-{span_id}-01")),
+        ("b3".to_string(), format!("{trace_id}-{span_id}-1")),
+        ("X-B3-TraceId".to_string(), trace_id),
+        ("X-B3-SpanId".to_string(), span_id.clone()),
+        ("X-B3-Sampled".to_string(), "1".to_string()),
+        (
+            "Accept-Language".to_string(),
+            accept_language.to_string(),
+        ),
+        ("X-Requested-With".to_string(), "XMLHttpRequest".to_string()),
+        ("X-CodeBuddy-Request".to_string(), "1".to_string()),
+        ("Origin".to_string(), origin.clone()),
+        ("Referer".to_string(), format!("{origin}/")),
     ];
     headers.extend(AuthService::build_auth_headers(session));
+    // X-Domain 兜底：登录态没带 domain 时按端点 authority 补（与
+    // `enterprise_headers` 的回退口径一致），渠道校验按它认站点。
+    if !headers.iter().any(|(key, _)| key == "X-Domain") {
+        headers.push(("X-Domain".to_string(), authority));
+    }
     if let Some(accept) = accept {
         headers.push(("Accept".to_string(), accept.to_string()));
     }
@@ -667,16 +802,39 @@ pub(super) fn chat_headers(
 /// 账号记录里带 `endpoint` 时仍然以它为准 —— 那是 staging / 自建反向代理
 /// 用户的落点，也是同一个账号级别的覆盖能力。
 pub(super) fn chat_completions_url(session: &Value, region: Region) -> String {
+    format!("{}/v2/chat/completions", session_endpoint(session, region))
+}
+
+/// 网页通道 agent 会话 URL：`{endpoint}/console/as/conversations/`。
+///
+/// 国际版上游把「当日活跃」（每日 30 积分的判定）记在网页通道的会话上
+/// （issue #277：桌面端 `chat/completions` 调用成功也不计）。网页应用与桌面
+/// 端同源一个站点，端点解析与 `chat_completions_url` 共用同一份规则 ——
+/// 国际版默认端点本来就是 `https://www.workbuddy.ai`（网页应用的域名）。
+pub(super) fn web_conversations_url(session: &Value, region: Region) -> String {
+    format!(
+        "{}/console/as/conversations/",
+        session_endpoint(session, region)
+    )
+}
+
+/// 会话生效端点：账号记录的 `endpoint` 覆盖优先，兜底本地区的端点。
+///
+/// 兜底端点取**本实例的地区**（拆家前取 `endpoints::default_context()`，
+/// 那是「本进程只有一个上游」时代的产物：它读 `WORKBUDDY_EDITION` 环境变量，
+/// 而现在两个地区同时存在，环境变量不该再决定某个 provider 打哪个站）。
+/// 账号记录里带 `endpoint` 时仍然以它为准 —— 那是 staging / 自建反向代理
+/// 用户的落点，也是同一个账号级别的覆盖能力。
+fn session_endpoint(session: &Value, region: Region) -> String {
     let fallback = region
         .env_endpoint_override()
         .unwrap_or_else(|| region.default_endpoint().to_string());
-    let endpoint = session
+    session
         .get("endpoint")
         .and_then(Value::as_str)
         .filter(|value| !value.is_empty())
         .map(crate::server::core::endpoints::normalize_endpoint)
-        .unwrap_or_else(|| crate::server::core::endpoints::normalize_endpoint(&fallback));
-    format!("{endpoint}/v2/chat/completions")
+        .unwrap_or_else(|| crate::server::core::endpoints::normalize_endpoint(&fallback))
 }
 
 /// 首条消息不是 system 时，在头部补一条系统消息（不改原数组，返回新 body）。

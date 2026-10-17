@@ -22,8 +22,12 @@
 //!                   外来 harness 身份句（上游 2026-09-22 起的 system 白名单，
 //!                   国内 / 国际版同闸，实测表在该文件头）
 //!   balance.rs      积分钱包 + 订阅信息查询（移植来源 `account-balance.mjs`）
-//!   checkin.rs      每日签到（**逆向**：老项目没有这条链路，接口从 AutoClaw
-//!                   桌面端的 app.asar 里读出并实测确认）
+//!   checkin.rs      每日签到 + 活动福利的触发与到账确认（**逆向**：老项目
+//!                   没有这条链路，接口从 AutoClaw 桌面端的 app.asar 里读出
+//!                   并实测确认；活动福利的「登录」触发走 user-info，见该文件头）
+//!   promotion.rs    活动福利到账确认（**逆向 + 实测**：Weekly Perks / 登录奖励
+//!                   这类活动没有领取接口、由服务端在「登录活跃」时自动入账，
+//!                   这里只读积分流水把今天的到账状态读回来，见该文件头）
 //!   oauth.rs        **国际版**的 OAuth 网页登录（Zai / Google）：服务端那两跳
 //!                   （取授权地址 / 用码换凭证）。浏览器那一半 —— 强制风控
 //!                   验证码 —— 在 `ui/autoclaw-oauth.js`（主窗口里跑阿里云 SDK）
@@ -75,6 +79,9 @@
 //! prompt::IDENTITY_LINE               上游要求的身份句（幂等判定用）
 //! balance::query_usage(&AccountStore, &str) -> Result<Value, GatewayError>
 //! checkin::claim_daily_signin(&AccountStore, &str) -> Result<Value, GatewayError>
+//! promotion::today_reward(&AccountStore, &str) -> Result<Value, GatewayError>
+//!                                      活动福利到账确认（Weekly Perks 等
+//!                                      「活跃即发」活动；无领取接口，见模块头）
 //! ```
 //!
 //! ── 两个 id 别搞混 ──────────────────────────────────────────
@@ -100,6 +107,7 @@ pub mod login;
 pub mod models;
 pub mod oauth;
 pub mod profile;
+pub mod promotion;
 pub mod prompt;
 pub mod refresh;
 pub mod region;

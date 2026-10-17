@@ -35,7 +35,7 @@ import {
 } from './accounts-shared'
 import {
   isDesktopAccount, isEnabled, isLimitedNow, isRateLimited,
-  supportsUsage,
+  supportsCreditDetail, supportsUsage,
 } from './accounts-domain'
 import * as domain from './accounts-domain'
 import { t } from '../i18n'
@@ -365,6 +365,16 @@ export function connectionsOf(id: string): number {
 /**
  * 拉一次连接数。失败静默：2 秒一次的轮询，后端不可达时 toast 会变成刷屏；
  * 且缓存保留上一轮的值比清空更贴近事实（用户看到的是「刚才还在跑」）。
+ *
+ * ── 数值没变就不写 store（本次改造）──────────────────────────
+ * 这条链路每 2 秒跑一次，而「有请求在跑」是少数时刻：绝大多数轮次里
+ * `connections` 都是同一份空表。原实现照写不误，而 store 的每次 `patch` 都会换一份
+ * 新快照（`useSyncExternalStore` 按引用判「变了没」）—— 于是账号页每 2 秒整体重渲染
+ * 一次，43 个账号 × 十几列的单元格全部重建，屏幕上却一个数字都没变。这里先比一遍，
+ * 相同就直接返回：那 2 秒一次的「重渲染整页」在空闲时彻底消失。
+ *
+ * 比较口径与写入口径必须一致（都是「只放 count > 0 的项」）—— 两个 Map 的构造
+ * 走的是同一段代码，所以「key 集合 + 每个值」全等都等价于「这份读数与上一份相同」。
  */
 export async function syncConnections(): Promise<boolean> {
   try {
@@ -375,12 +385,25 @@ export async function syncConnections(): Promise<boolean> {
       const count = Number(value) || 0
       if (count > 0) connections.set(id, count)
     }
+    if (sameConnections(connections, getStore().connections)) return true
     patch({ connections })
     return true
   } catch {
     // 静默：下一次轮询自然重试（与 app.js 的 refresh / syncLogsBadge 同一取舍）
     return false
   }
+}
+
+/** 两份连接数读数是否完全相同（key 集合与每个值；见 syncConnections 的说明） */
+function sameConnections(
+  next: ReadonlyMap<string, number>,
+  prev: ReadonlyMap<string, number>,
+): boolean {
+  if (next.size !== prev.size) return false
+  for (const [id, count] of next) {
+    if (prev.get(id) !== count) return false
+  }
+  return true
 }
 
 /**
@@ -466,6 +489,67 @@ export function applyBalances(
 }
 
 /**
+ * 启动时的一次「形状补齐」：记录表里的读数是**旧版本**写的时，把那一行重新查一遍。
+ *
+ * ── 为什么需要它 ────────────────────────────────────────────
+ * 余额与明细是**同一条**读数（记录表 `account_usage_records.usage` 那一份文档，
+ * 见后端 `usage_query::snapshot`），所以明细本来就有缓存、不必每次手点。但缓存的
+ * 是**上一次查询那一刻**那份文档：它是旧版本写进去的话，里面就没有明细那一段
+ * （旧版 WorkBuddy 只写五键简报，Trae 也没有 `credits[]`），界面上于是只剩余额
+ * ——「打开软件只加载余额、要点一下余额才出明细」说的就是这个。旧文档有两个来源，
+ * 都不是这一次会话能左右的：
+ *   · 升级时后端把旧 kv 快照导进记录表（`usage_records::migrate_legacy_snapshot`），
+ *     导进去的就是旧形状；
+ *   · 与旧版本实例**共用同一个库**时（桌面壳允许开发版 / 正式版并存），旧实例的
+ *     定时查询会把记录写回旧形状。
+ * 不补的话，那一行要等到**下一次到期**才刷新 —— 间隔按账号配置，长的能到十几分钟
+ * 甚至一天，这就是"每次打开都要手点一下"。
+ *
+ * ── 为什么在前端做，而不是后端调度 ───────────────────────────
+ * 「这家该不该有明细」这个判据（`creditDetail` 能力位）住在前端
+ * （accounts-domain 的 PROVIDER_FEATURES），后端没有同一份名单；搬过去等于再写
+ * 一份、迟早漂。而这边本来就有一切：缓存条目、能力位、单账号查询的现成动作。
+ *
+ * ── 三条纪律（都为了"补齐不该把界面弄得更差"）─────────────────
+ *   1. **每个会话只做一次**：这是补齐旧文档，不是维持读数新鲜（那是后端心跳的
+ *      职责）。一次性的量封住了，也不会因为「上游本来就没有明细」（补齐之后依旧
+ *      没有 `credits` 的那些账号）来回空转；
+ *   2. **失败不落缓存**：查询没成 / 上游没返回这一行时把原条目放回去 —— 为了补一段
+ *      明细把一格好读数换成「查询失败」是本末倒置；
+ *   3. **不播报、不摆「查询中」**：走 `queryUsageFor`（行上「余额」按钮那条动作的
+ *      执行体），而不是带播报的 `queryUsageOnce`；界面安静地换成新读数。
+ */
+let shapeRepairStarted = false
+
+/** 缓存条目缺了本家当前会产出的明细段（= 旧版本写的读数）。 */
+function detailMissing(account: AccountRecord): boolean {
+  if (!supportsCreditDetail(account)) return false
+  const entry = usageEntryOf(account)
+  if (!entry || typeof entry !== 'object' || Array.isArray(entry)) return false
+  if (usageFailureOf(entry)) return false
+  // 有 `credits` 键就是当前形状（哪怕空数组 = 上游这一轮确实没有可列的包）
+  return !Array.isArray(entry.credits)
+}
+
+async function repairStaleDetail(): Promise<void> {
+  if (shapeRepairStarted) return
+  shapeRepairStarted = true
+  for (const account of allAccounts().filter(detailMissing)) {
+    const before = usageMap.get(account.id)
+    try {
+      await queryUsageFor(account.id)
+    } catch {
+      // 静默（纪律 2）：网络层失败时 `queryUsageFor` 一个键都没写
+    }
+    const after = usageMap.get(account.id)
+    if (before !== undefined && (!after || usageFailureOf(after))) {
+      putUsage(account.id, before, Date.now())
+    }
+    bump()
+  }
+}
+
+/**
  * 拉一次后端的余额快照并写进缓存，返回是否应用了新的一轮。
  *
  * 余额查询按账号各自的间隔在后端自动跑（账号设置里逐账号配置），结论存进
@@ -497,6 +581,8 @@ export async function syncBalancesSnapshot(): Promise<boolean> {
     if (!at || at === lastSnapshotAt) return tokenApplied
     lastSnapshotAt = at
     if (!applyBalances(data)) return tokenApplied
+    // 首轮快照落下之后再查有没有「旧版本写的读数」（每个会话只做一次，见上）
+    void repairStaleDetail()
     return true
   } catch {
     // 静默：下一次轮询自然重试；账号页保持上一轮的结果不变

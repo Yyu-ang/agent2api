@@ -56,6 +56,7 @@ import {
   type AppSettings,
   type ClineHeadersData,
   type GatewayBlocks,
+  type ModelsDevState,
   type NumberField,
   type PromptPatch,
 } from './settings-model'
@@ -82,10 +83,13 @@ export type BusyScope =
   | 'routing'
   | 'debug'
   | 'sanitize'
+  | 'developerRoleCompat'
   | 'clineHeaders'
   | 'cors'
   | 'prompt'
   | 'captcha'
+  | 'modelsDev'
+  | 'modelsDevRefresh'
   | 'export'
   | 'import'
   | 'dbExport'
@@ -125,7 +129,17 @@ export type NumericState = { status: LoadStatus; values: Record<string, number> 
  * 账号路由（策略 + 会话粘性）：两档都是受控枚举，读不到时档位回落后端默认
  * （order / auto，由视图侧按合法值表兜底）。
  */
-export type RoutingState = { status: LoadStatus; strategy: string; sticky: string }
+export type RoutingState = {
+  status: LoadStatus
+  strategy: string
+  sticky: string
+  /** 失败退避：转发失败的账号休息一会儿再回来（后端默认开） */
+  failoverBackoff: boolean
+  /** 限流垫底：还有额度时被 429 的账号排到队尾（后端默认开） */
+  sink: boolean
+  /** 熔断开关：连续失败到阈值后打开（后端默认关） */
+  breakerEnabled: boolean
+}
 
 export type DebugState = {
   status: LoadStatus
@@ -137,6 +151,9 @@ export type DebugState = {
 
 export type SanitizeState = { status: LoadStatus; on: boolean }
 
+/** 开发者角色兼容开关；与 SanitizeState 同形 */
+export type DeveloperRoleCompatState = { status: LoadStatus; on: boolean }
+
 /** Cline 伪装头：三份表（默认 / 覆盖 / 生效）都来自后端，界面据此渲染与判断改动 */
 export type ClineHeadersState = {
   status: LoadStatus
@@ -147,6 +164,20 @@ export type ClineHeadersState = {
 
 /** 网关面（/v1/*）跨域访问开关；与 SanitizeState 同形 */
 export type CorsState = { status: LoadStatus; on: boolean }
+
+/**
+ * models.dev 模型元数据：开关 + 「这份数据是什么时候的、有多少条」。
+ *
+ * `source` 三档与后端同字面量（`builtin` / `cache` / `network`），文案映射在
+ * 视图层；未知值原样回显（后端将来加了档位，界面不会显示成空白）。
+ */
+export type ModelsDevPanelState = {
+  status: LoadStatus
+  enabled: boolean
+  source: string
+  updatedAt: number
+  count: number
+}
 
 export type PromptState = {
   status: LoadStatus
@@ -241,11 +272,20 @@ export type SettingsSnapshot = {
   routing: RoutingState
   debug: DebugState
   sanitize: SanitizeState
+  developerRoleCompat: DeveloperRoleCompatState
   clineHeaders: ClineHeadersState
   cors: CorsState
   prompt: PromptState
   storage: StorageState
   captcha: { available: boolean; enabled: boolean }
+  /**
+   * models.dev 模型元数据（能力位与逐模型思考档位）。
+   *
+   * 与 `captcha` 的三态不同，这里多两项**读数**（来源与生成时刻、条数）：
+   * 这个开关的价值全在「那份元数据是什么时候的、有多少条」，只给一个布尔值
+   * 等于把功能做成一个不知道有没有生效的按钮。
+   */
+  modelsDev: ModelsDevPanelState
   ioFailure: IoFailure
   /** 保留期改小的确认框正文（非空即开着）；确认 / 取消都收口到 resolveRetentionConfirm */
   retentionConfirm: { head: string } | null
@@ -255,6 +295,15 @@ export type SettingsSnapshot = {
    */
   dbIncludeLogs: boolean
   dbBackupConfirm: { includeLogs: boolean } | null
+  /**
+   * 整库恢复返回的密钥警告原文（`DatabaseImportResult.warning`；null = 没有警告）。
+   *
+   * 存进快照而不是只弹 toast：这条警告决定导入后的账号能不能解开（密钥不匹配时
+   * 账号列表是空的），必须**常驻**在面板里等用户看到 —— toast 只亮 3.5 秒（app.js），
+   * 错过就再没有第二次提示。生命周期与 ioFailure 同约定：只反映最近一次恢复，
+   * 下一次恢复开始时清掉。
+   */
+  dbWarning: string | null
   /** 局域网访问的确认框（非空即开着）；确认 / 取消都收口到 resolveLanConfirm */
   lanConfirm: LanConfirm
   /** 局域网开启流程的注册步（非空 = 弹窗切到注册表单） */
@@ -301,9 +350,10 @@ const INITIAL: SettingsSnapshot = {
   timeouts: { status: 'loading', values: null },
   queue: { status: 'loading', values: null },
   captchaPool: { status: 'loading', values: null },
-  routing: { status: 'loading', strategy: 'order', sticky: 'auto' },
+  routing: { status: 'loading', strategy: 'order', sticky: 'auto', failoverBackoff: true, sink: true, breakerEnabled: false },
   debug: { status: 'loading', on: false, count: null, limit: null },
   sanitize: { status: 'loading', on: false },
+  developerRoleCompat: { status: 'loading', on: false },
   clineHeaders: { status: 'loading', defaults: {}, overrides: {}, effective: {} },
   cors: { status: 'loading', on: false },
   prompt: {
@@ -333,11 +383,13 @@ const INITIAL: SettingsSnapshot = {
     debug: null,
   },
   captcha: { available: true, enabled: false },
+  modelsDev: { status: 'loading', enabled: true, source: '', updatedAt: 0, count: 0 },
   ioFailure: null,
   retentionConfirm: null,
   // 整库备份：默认包含日志与调试报文（完整备份）；恢复确认弹窗默认关闭
   dbIncludeLogs: true,
   dbBackupConfirm: null,
+  dbWarning: null,
   lanConfirm: null,
   lanRegister: null,
   panelLogin: false,
@@ -818,6 +870,8 @@ async function proceedDbRestore(): Promise<void> {
     return
   }
   beginBusy('dbImport')
+  // 结果区只反映最近一次操作：上一次恢复留下的密钥警告先清掉（与 ioFailure 同一约定）
+  publish({ dbWarning: null })
   try {
     const result = await api.importDatabase()
     const tables = Array.isArray(result?.tables) ? result.tables.length : 0
@@ -825,6 +879,11 @@ async function proceedDbRestore(): Promise<void> {
       ? t('，替换前的数据已备份为 {name}', { name: result.safetyBackup })
       : ''
     toast(t('✅ 已恢复 {n} 张表{note}', { n: tables, note }))
+    // 密钥指纹不匹配的警告（账号将无法解密）：后端把文案给全了，这里只负责让它
+    // 在面板里**常驻**显示 —— 光靠上面那条 3.5 秒的 toast，用户错过后只会对着
+    // 空账号列表发懵，不知道「为什么账号都没了」
+    const warning = typeof result?.warning === 'string' ? result.warning.trim() : ''
+    if (warning) publish({ dbWarning: warning })
     // 重拉整页（含启动/托盘设置、保留期、提示词、存储概况等全部面板）
     await load()
     await shared().wbApp?.refresh?.()
@@ -835,7 +894,7 @@ async function proceedDbRestore(): Promise<void> {
   }
 }
 
-/* ─── 数据保留（三项保留天数） ─────────────── */
+/* ─── 数据保留（事件日志保留天数） ─────────────── */
 
 export function renderRetention(data?: unknown): void {
   if (data === undefined) return
@@ -874,7 +933,7 @@ function askRetentionShrink(head: string): Promise<boolean> {
   })
 }
 
-/** 改小保留期会立即删数据，文案必须点名「删的是哪一档」 */
+/** 改小保留期会立即删数据，文案必须点名「删的是哪一档」（泛化：选项来自 RETENTION_FIELDS） */
 function shrinkPromptHead(field: NumberField, previous: number | null, days: number): string {
   return previous === null
     ? t('没能读到「{label}」的当前值，改为 {days} 天可能会删除超出的历史数据。', {
@@ -1077,6 +1136,9 @@ export async function saveCaptchaPoolField(field: NumberField, raw: string): Pro
 /** 后端给的路由配置里我们关心的两个键（与 /api/routing 的长键名逐字对应） */
 const ROUTING_STRATEGY_KEY = 'routingStrategy'
 const ROUTING_STICKY_KEY = 'routingSticky'
+const ROUTING_FAILOVER_BACKOFF_KEY = 'routingFailoverBackoff'
+const ROUTING_SINK_KEY = 'routingSink'
+const ROUTING_BREAKER_ENABLED_KEY = 'routingBreakerEnabled'
 
 /** 路由配置的合法取值表（逐字来自 settings-model 的档位表，校验与兜底共用） */
 const ROUTING_VALID: Record<string, ReadonlySet<string>> = {
@@ -1085,13 +1147,30 @@ const ROUTING_VALID: Record<string, ReadonlySet<string>> = {
 }
 
 /** 路由响应 → 快照值：只认合法档位，读不到 / 非法时按该键的默认档兜底 */
-function routingValuesFrom(data: unknown): { strategy: string; sticky: string } {
+function routingValuesFrom(data: unknown): {
+  strategy: string
+  sticky: string
+  failoverBackoff: boolean
+  sink: boolean
+  breakerEnabled: boolean
+} {
   const record = (data && typeof data === 'object' ? data : {}) as Record<string, unknown>
   const pick = (key: string, fallback: string): string => {
     const raw = record[key]
     return typeof raw === 'string' && ROUTING_VALID[key].has(raw) ? raw : fallback
   }
-  return { strategy: pick(ROUTING_STRATEGY_KEY, 'order'), sticky: pick(ROUTING_STICKY_KEY, 'auto') }
+  // 三个布尔开关：只认字面 true / false（后端返回的一定是布尔），缺字段时回落后端默认值
+  const pickBool = (key: string, fallback: boolean): boolean => {
+    const raw = record[key]
+    return typeof raw === 'boolean' ? raw : fallback
+  }
+  return {
+    strategy: pick(ROUTING_STRATEGY_KEY, 'order'),
+    sticky: pick(ROUTING_STICKY_KEY, 'auto'),
+    failoverBackoff: pickBool(ROUTING_FAILOVER_BACKOFF_KEY, true),
+    sink: pickBool(ROUTING_SINK_KEY, true),
+    breakerEnabled: pickBool(ROUTING_BREAKER_ENABLED_KEY, false),
+  }
 }
 
 export async function loadRouting(): Promise<void> {
@@ -1109,7 +1188,13 @@ export async function loadRouting(): Promise<void> {
  * 保存两档之一：PUT 契约返回生效后的全量值（与超时 / 重试同一模式），直接按响应刷新。
  * 后端只认长键名；未知档位在界面上就发不出来（SegmentedControl 的取值来自档位表）。
  */
-export async function saveRoutingField(patch: { routingStrategy?: string; routingSticky?: string }): Promise<void> {
+export async function saveRoutingField(patch: {
+  routingStrategy?: string
+  routingSticky?: string
+  routingFailoverBackoff?: boolean
+  routingSink?: boolean
+  routingBreakerEnabled?: boolean
+}): Promise<void> {
   if (busyScope) return
   const bridge = shared().workbuddyDesktop
   if (!bridge?.setRoutingConfig) {
@@ -1328,6 +1413,43 @@ export async function saveSanitize(next: boolean): Promise<void> {
   }
 }
 
+/* ─── 开发者角色兼容（developer 角色消息归一为 system）── */
+
+export function renderDeveloperRoleCompat(data?: unknown): void {
+  if (data === undefined) return
+  if (!data || typeof data !== 'object') {
+    publish({ developerRoleCompat: { status: 'unavailable', on: false } })
+    return
+  }
+  const record = data as Record<string, unknown>
+  publish({ developerRoleCompat: { status: 'ready', on: record.developerRoleCompat === true } })
+}
+
+async function loadDeveloperRoleCompat(): Promise<void> {
+  try {
+    renderDeveloperRoleCompat(await shared().workbuddyDesktop?.getDeveloperRoleCompat())
+  } catch (error) {
+    console.warn('读取开发者角色兼容设置失败:', errorMessage(error))
+    renderDeveloperRoleCompat(null)
+  }
+}
+
+export async function saveDeveloperRoleCompat(next: boolean): Promise<void> {
+  if (busyScope) { repaint(); return }
+  beginBusy('developerRoleCompat')
+  publish({ developerRoleCompat: { status: 'ready', on: next } })
+  try {
+    const saved = await shared().workbuddyDesktop?.saveDeveloperRoleCompat(next)
+    renderDeveloperRoleCompat(saved)
+    toast(next ? t('✅ 开发者角色兼容已开启') : t('已关闭开发者角色兼容'))
+  } catch (error) {
+    toast(t('保存失败：{message}', { message: errorMessage(error) }), 'err')
+    await loadDeveloperRoleCompat() // 回滚到后端的真实值
+  } finally {
+    endBusy()
+  }
+}
+
 /* ─── Cline 伪装头（转发头的逐键覆盖）── */
 
 /** 非字符串值一律丢弃（后端只会给字符串，这里是给「形状不对的响应」兜底） */
@@ -1452,6 +1574,80 @@ export async function saveCaptcha(next: boolean): Promise<void> {
   } catch (error) {
     toast(t('保存失败：{message}', { message: errorMessage(error) }), 'err')
     await loadCaptcha()
+  } finally {
+    endBusy()
+  }
+}
+
+/* ─── models.dev 模型元数据（能力位与逐模型思考档位）── */
+
+/** 把后端的响应折成面板状态（两处调用共用：读设置与刷新后的回读） */
+function modelsDevState(state: ModelsDevState | null | undefined): ModelsDevPanelState {
+  if (!state || typeof state !== 'object') {
+    return { status: 'unavailable', enabled: true, source: '', updatedAt: 0, count: 0 }
+  }
+  return {
+    status: 'ready',
+    // 缺字段时按「开」处理：这个开关默认开（后端同理），显示成关会让用户以为
+    // 自己没开过，而去拨一个本来已经生效的开关
+    enabled: state.modelsDevEnabled !== false,
+    source: typeof state.source === 'string' ? state.source : '',
+    updatedAt: Number(state.updatedAt) || 0,
+    count: Number(state.count) || 0,
+  }
+}
+
+async function loadModelsDev(): Promise<void> {
+  try {
+    const state = await shared().workbuddyDesktop?.getModelsDev?.()
+    publish({ modelsDev: modelsDevState(state) })
+  } catch (error) {
+    publish({ modelsDev: { ...snapshot.modelsDev, status: 'unavailable' } })
+    console.warn('读取 models.dev 元数据设置失败:', errorMessage(error))
+  }
+}
+
+export async function saveModelsDev(next: boolean): Promise<void> {
+  if (busyScope) { repaint(); return }
+  beginBusy('modelsDev')
+  publish({ modelsDev: { ...snapshot.modelsDev, enabled: next } })
+  try {
+    const state = await shared().workbuddyDesktop?.saveModelsDev?.(next)
+    publish({ modelsDev: modelsDevState(state) })
+    toast(next ? t('✅ models.dev 模型元数据已开启') : t('已关闭 models.dev 联网刷新'))
+  } catch (error) {
+    toast(t('保存失败：{message}', { message: errorMessage(error) }), 'err')
+    await loadModelsDev() // 回滚到后端的真实值
+  } finally {
+    endBusy()
+  }
+}
+
+/**
+ * 「立即刷新」：真去拉一次 models.dev（不是重读设置）。
+ *
+ * 与别处的刷新按钮语义不同 —— 那些按钮重读的是**本机配置**，这一个打的是
+ * **公网**，结果行按各家目录刷新那套三档文案讲清楚（成功 / 本次没刷 / 失败）。
+ */
+export async function refreshModelsDev(): Promise<void> {
+  if (busyScope) { repaint(); return }
+  beginBusy('modelsDevRefresh')
+  try {
+    const payload = await shared().workbuddyDesktop?.refreshModelsDev?.()
+    publish({ modelsDev: modelsDevState(payload?.status) })
+    const result = payload?.result
+    const status = String(result?.status || '')
+    if (status === 'refreshed') {
+      toast(t('models.dev 元数据已更新（{count} 条）', { count: Number(result?.count) || 0 }))
+    } else if (status === 'failed') {
+      toast(t('刷新失败：{message}', { message: String(result?.message || '') }), 'err')
+    } else {
+      // skipped：未到间隔 / 设置里关着 —— 原因由后端给，原样透出
+      toast(String(result?.message || t('本次无需刷新')))
+    }
+  } catch (error) {
+    toast(t('刷新失败：{message}', { message: errorMessage(error) }), 'err')
+    await loadModelsDev()
   } finally {
     endBusy()
   }
@@ -1961,11 +2157,13 @@ export async function load(): Promise<void> {
     loadRouting(),
     loadDebug(),
     loadSanitize(),
+    loadDeveloperRoleCompat(),
     loadClineHeaders(),
     loadCors(),
     loadPrompt(),
     loadStorage(),
     loadCaptcha(),
+    loadModelsDev(),
     // 软件更新面板是另一个岛（update-panel.tsx），切进设置页时让它自己刷新一次
     shared().wbUpdatePanel?.load?.(),
   ])
@@ -2011,6 +2209,11 @@ export async function refreshDebug(): Promise<void> {
 export async function refreshSanitize(): Promise<void> {
   await loadSanitize()
   toast(t('指纹脱敏设置已刷新'))
+}
+
+export async function refreshDeveloperRoleCompat(): Promise<void> {
+  await loadDeveloperRoleCompat()
+  toast(t('开发者角色兼容设置已刷新'))
 }
 
 export async function refreshCors(): Promise<void> {
