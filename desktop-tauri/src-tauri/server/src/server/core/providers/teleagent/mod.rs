@@ -42,9 +42,11 @@
 pub mod adapter;
 pub mod auth;
 pub mod chat;
+pub mod confirmations;
 pub mod models;
 pub mod protocol;
 pub mod stream;
+pub mod session;
 
 /// super-agent 的监听地址（teleagent-openai-proxy 写死的常量）
 pub const SUPER_AGENT_HOST: &str = "127.0.0.1";

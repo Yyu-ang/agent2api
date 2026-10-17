@@ -8,16 +8,15 @@
 //! `error`（`data.message` + `data.code`，终止流）。
 //!
 //! ── 多轮与模型 ──────────────────────────────────────────────
-//! 上游 `content` 是单条文本：本轮把 OpenAI messages 拍平成一条 prompt
-//! （system → `[系统指令]`、assistant → `[助手之前的回复]`，与 kuku 的
-//! `build_prompt` 同口径）。参考实现的「增量发送」（只发新增消息、历史靠
-//! 上游会话记忆）是带宽优化，本版先全量 —— 正确性不受影响（见遗留问题）。
+//! 上游 `content` 是单条文本：OpenAI messages 拍平成一条 prompt。
+//! 带明确 conversation_id 的请求采用会话复用 + 指纹增量，历史变化时安全重建；
+//! 未提供会话 ID 则独立建会话并以 16k 字符预算裁剪输入，避免跨客户端串上下文。
 //! 模型参数 `selected_model` 必须传目录里的 `display_name`
 //! （`models::resolve_model` 归一）。
 //!
-//! ── 会话是请求内的 ─────────────────────────────────────────
-//! 与 KukuAI 同属 `is_stateful = true` 但会话**不跨请求**（每次新建、用毕即弃），
-//! 因此没有会话注册表 —— `run_chat` 单函数完成「建会话 → 流式 → 收尾」。
+//! ── 会话安全边界 ─────────────────────────────────────────
+//! 会话注册表在 `session.rs`：地区、账号、凭证、模型与显式会话 ID 全部隔离；
+//! tokio owned guard 跨越整个 SSE 生命周期，失败撤销增量指纹。
 //!
 //! ── 错误口径 ──────────────────────────────────────────────
 //!   - 401/403 → 登录态失效（上游无刷新接口）：`GatewayError` 401，由
@@ -73,12 +72,35 @@ pub async fn run_chat(
         .and_then(Value::as_str)
         .unwrap_or("默认")
         .to_string();
-    let model = super::models::resolve_model(region, &client_model);
-    let prompt = build_prompt(body.get("messages"));
+    let model = super::models::resolve_model(region, &client_model)?;
+    let fingerprints = super::session::fingerprints(body.get("messages"));
+    // 只有显式 conversation_id 才启用复用；没有身份的兼容调用维持请求隔离。
+    let mut conversation = match super::session::entry(region, account_id, &credentials.token, &model, body) {
+        Some(state) => Some(state.lock_owned().await),
+        None => None,
+    };
+    if body.get("reset_session").and_then(Value::as_bool) == Some(true) {
+        if let Some(item) = conversation.as_mut() { item.reset(); }
+    }
+    let previous = conversation.as_ref().and_then(|item| {
+        let id = item.session_id.as_ref()?;
+        let index = super::session::delta_start(&item.sent, &fingerprints)?;
+        Some((id.clone(), index))
+    });
+    let messages = body.get("messages");
+    let (session_id, prompt) = if let Some((id, start)) = previous {
+        let delta = messages.and_then(Value::as_array)
+            .map(|items| super::session::delta_messages(items, start))
+            .unwrap_or_default();
+        let prompt = build_prompt(Some(&Value::Array(delta)));
+        (id, prompt)
+    } else {
+        // 会话失效或历史被编辑：新建上游会话并安全回退全量（带 16k 预算）。
+        if let Some(item) = conversation.as_mut() { item.reset(); }
+        let session = create_session(region, &credentials, proxy.as_ref()).await?;
+        (session, build_prompt(messages))
+    };
     let proxy_ref = proxy.as_ref();
-
-    // ── 建会话 ──────────────────────────────────────────────
-    let session_id = create_session(region, &credentials, proxy_ref).await?;
 
     // ── 对话（SSE；499 自动刷新签名 key 重试一次）─────────────
     let url = format!("{}/api/v1/chat/completion", region.base_url());
@@ -93,7 +115,12 @@ pub async fn run_chat(
     }
 
     if !stream {
-        return aggregate(response, &client_model, &prompt).await;
+        let outcome = aggregate(response, &client_model, &prompt).await;
+        if let Some(item) = conversation.as_mut() {
+            if outcome.is_ok() { item.commit(session_id, fingerprints); }
+            else { item.reset(); }
+        }
+        return outcome;
     }
 
     // 流式：后台任务喂 mpsc，主路径返回 ReceiverStream（与 KukuAI 同结构）
@@ -101,9 +128,40 @@ pub async fn run_chat(
     let requested = client_model;
     let prompt_chars = prompt.chars().count();
     crate::spawn_task(async move {
-        let outcome = drive_stream(response, &requested, prompt_chars, &sender).await;
-        if let Err(error) = outcome {
-            crate::server::logging::verbose("[Tabbit]", &format!("对话流处理中断：{}", error.message));
+        // OwnedMutexGuard 持有到完整 SSE 完成，避免同一上游会话并发发送。
+        let mut conversation = conversation;
+        let mut response = response;
+        let session_id = session_id;
+        for attempt in 0..=BUSY_RETRY_MAX {
+            match drive_stream(response, &requested, prompt_chars, &sender).await {
+                Ok(()) => {
+                    if let Some(state) = conversation.as_mut() {
+                        state.commit(session_id.clone(), fingerprints.clone());
+                    }
+                    break;
+                }
+                Err(error) if is_busy_retry(&error) && attempt < BUSY_RETRY_MAX => {
+                    // 复用同一会话，延时后重新发送；不能重建会话却只发增量历史。
+                    tokio::time::sleep(std::time::Duration::from_millis(BUSY_WAIT_MS)).await;
+                    let payload = protocol::chat_body(&session_id, &prompt, &model);
+                    response = match send_chat_with_retry(
+                        region, &credentials, &session_id, &payload, &url, proxy.as_ref(),
+                    ).await {
+                        Ok(next) => next,
+                        Err(error) => {
+                            if let Some(state) = conversation.as_mut() { state.reset(); }
+                            let _ = sender.send(Err(std::io::Error::other(error.message))).await;
+                            break;
+                        }
+                    };
+                }
+                Err(error) => {
+                    if let Some(state) = conversation.as_mut() { state.reset(); }
+                    crate::server::logging::verbose("[Tabbit]", &format!("对话流处理中断：{}", error.message));
+                    let _ = sender.send(Err(std::io::Error::other(error.message))).await;
+                    break;
+                }
+            }
         }
     });
     Ok(ForwardOutcome::Stream {
@@ -123,9 +181,8 @@ async fn create_session(
     headers.push(("Accept".to_string(), "application/json".to_string()));
     headers.push(("Pragma".to_string(), "no-cache".to_string()));
     headers.push(("Cache-Control".to_string(), "no-cache".to_string()));
-    // 空 body 的 POST：http::post_json_value 会拼 Content-Type json 头；
-    // 参考实现发的是 content=b"" —— 这里用空 JSON 对象，上游兼容（空 body）
-    let value = super::http::post_json_value(&url, &headers, &json!({}), proxy, Some(REQUEST_TIMEOUT_MS))
+    // 与参考客户端一致：零字节 POST body，不是 JSON "{}"。
+    let value = super::http::post_empty_value(&url, &headers, proxy, Some(REQUEST_TIMEOUT_MS))
         .await?;
     let session_id = value
         .get("chat_session_id")
@@ -169,33 +226,72 @@ async fn send_chat_with_retry(
 }
 
 /// 把 OpenAI messages 拍平成单条 prompt（上游 content 是单文本，参考同口径）。
+const PROMPT_BUDGET: usize = 16_000;
+const MAX_SINGLE_MESSAGE: usize = 9_000;
+
+/// 裁剪单条超长消息，保留头尾，并明确告诉上游内容发生了截断。
+fn excerpt(text: &str, limit: usize) -> String {
+    let total = text.chars().count();
+    if total <= limit { return text.to_string(); }
+    let marker = "\n[较早的内容已截断]\n";
+    let room = limit.saturating_sub(marker.chars().count());
+    let head = room * 2 / 3;
+    let tail = room - head;
+    let prefix: String = text.chars().take(head).collect();
+    let suffix: String = text.chars().rev().take(tail).collect::<Vec<_>>().into_iter().rev().collect();
+    format!("{prefix}{marker}{suffix}")
+}
+
+/// 单次 Tabbit API 的实际输入有长度限制。参照 tabbit2api 的 16k/9k 预算：
+/// 保留 system 和最新消息，其余历史从新到旧按剩余预算选取。
 fn build_prompt(messages: Option<&Value>) -> String {
-    let Some(Value::Array(items)) = messages else {
-        return "你好".to_string();
-    };
-    if items.is_empty() {
-        return "你好".to_string();
+    let Some(Value::Array(items)) = messages else { return "你好".to_string(); };
+    if items.is_empty() { return "你好".to_string(); }
+    let mut entries: Vec<(String, bool)> = Vec::new();
+    for msg in items {
+        let role = msg.get("role").and_then(Value::as_str).unwrap_or("user");
+        let Some(content) = content_text(msg) else { continue };
+        if content.trim().is_empty() { continue; }
+        let (text, is_system) = match role {
+            "system" => (format!("[系统指令] {content}"), true),
+            "assistant" => (format!("[助手之前的回复] {content}"), false),
+            "tool" => (format!("[工具执行结果] {content}"), false),
+            _ => (content, false),
+        };
+        entries.push((text, is_system));
     }
-    if items.len() == 1 {
-        return content_text(&items[0]).unwrap_or_else(|| "你好".to_string());
+    if entries.is_empty() { return "你好".to_string(); }
+    if entries.len() == 1 { return excerpt(&entries[0].0, MAX_SINGLE_MESSAGE); }
+    let count = entries.len();
+    let mut chosen = vec![false; count];
+    let mut budget = PROMPT_BUDGET;
+    // 先保留系统指令（多个 system 也独立占预算）。
+    for (idx, (text, is_system)) in entries.iter_mut().enumerate() {
+        if !*is_system { continue; }
+        *text = excerpt(text, MAX_SINGLE_MESSAGE.min(3_000).min(budget));
+        let size = text.chars().count() + 2;
+        if size <= budget { chosen[idx] = true; budget -= size; }
     }
-    let mut lines: Vec<String> = Vec::new();
-    for message in items {
-        let role = message.get("role").and_then(Value::as_str).unwrap_or("user");
-        let Some(text) = content_text(message) else { continue };
-        if text.trim().is_empty() {
-            continue;
+    // 最新一轮用户输入优先，允许截断超大消息但不能整条丢弃。
+    if let Some(idx) = (0..count).rev().find(|&i| !entries[i].1) {
+        let keep = MAX_SINGLE_MESSAGE.min(budget.saturating_sub(2));
+        if keep > 40 {
+            entries[idx].0 = excerpt(&entries[idx].0, keep);
+            let size = entries[idx].0.chars().count() + 2;
+            chosen[idx] = true;
+            budget = budget.saturating_sub(size);
         }
-        match role {
-            "system" => lines.push(format!("[系统指令] {text}")),
-            "assistant" => lines.push(format!("[助手之前的回复] {text}")),
-            _ => lines.push(text),
-        }
     }
-    if lines.is_empty() {
-        return "你好".to_string();
+    // 其余消息从最近往前放，保证总长度不会触发上游超长 492。
+    for idx in (0..count).rev() {
+        if chosen[idx] || entries[idx].1 { continue; }
+        let size = entries[idx].0.chars().count() + 2;
+        if size <= budget { chosen[idx] = true; budget -= size; }
     }
-    lines.join("\n\n")
+    let parts: Vec<String> = entries.into_iter().enumerate()
+        .filter_map(|(idx, (text, _))| chosen[idx].then_some(text))
+        .collect();
+    if parts.is_empty() { "你好".to_string() } else { parts.join("\n\n") }
 }
 
 /// 取一条消息的可读文本（content 字符串或 text 类型的部件数组）。
@@ -233,31 +329,35 @@ enum TabbitEvent {
 /// 按 `\n\n` 分帧、逐帧取 `event:` / `data:` 的解析器。
 #[derive(Default)]
 struct SseScanner {
-    buffer: String,
+    buffer: Vec<u8>,
 }
 
 impl SseScanner {
-    fn push(&mut self, text: &str) -> Vec<TabbitEvent> {
-        self.buffer.push_str(text);
+    fn push(&mut self, bytes: &[u8]) -> Vec<TabbitEvent> {
+        self.buffer.extend_from_slice(bytes);
         let mut events = Vec::new();
-        while let Some(split_at) = self.buffer.find("\n\n") {
-            let raw: String = self.buffer.drain(..=split_at + 1).collect();
-            let mut name: Option<&str> = None;
-            let mut data_lines: Vec<&str> = Vec::new();
-            for line in raw.split('\n') {
-                if let Some(event) = line.strip_prefix("event:") {
-                    name = Some(event.trim());
-                } else if let Some(data) = line.strip_prefix("data:") {
-                    data_lines.push(data.trim());
-                }
+        while let Some((at, width)) = {
+            let crlf = self.buffer.windows(4).position(|x| x == b"\r\n\r\n").map(|i| (i, 4));
+            let lf = self.buffer.windows(2).position(|x| x == b"\n\n").map(|i| (i, 2));
+            match (crlf, lf) {
+                (Some(a), Some(b)) => Some(if a.0 < b.0 { a } else { b }),
+                (Some(a), None) => Some(a),
+                (None, Some(b)) => Some(b),
+                _ => None,
             }
-            if name.is_none() && data_lines.is_empty() {
-                continue;
+        } {
+            let raw: Vec<u8> = self.buffer.drain(..at + width).collect();
+            let Ok(text) = String::from_utf8(raw) else { continue };
+            let mut event_name: Option<&str> = None;
+            let mut data = Vec::new();
+            for line in text.lines() {
+                let line = line.trim_end_matches('\r');
+                if let Some(name) = line.strip_prefix("event:") { event_name = Some(name.trim()); }
+                if let Some(payload) = line.strip_prefix("data:") { data.push(payload.trim_start()); }
             }
-            let data_str = data_lines.join("\n");
-            let parsed: Value = serde_json::from_str(&data_str).unwrap_or(Value::Null);
-            for event in event_from_parts(name.unwrap_or("message_chunk"), &parsed) {
-                events.push(event);
+            let parsed = serde_json::from_str::<Value>(&data.join("\n")).unwrap_or(Value::Null);
+            if event_name.is_some() || !data.is_empty() {
+                events.extend(event_from_parts(event_name.unwrap_or("message_chunk"), &parsed));
             }
         }
         events
@@ -347,12 +447,12 @@ impl TabbitStream {
     }
 
     /// 喂一段字节，返回该段触发的帧；上游错误事件 → Err（调用方按分类处理）。
-    fn feed(&mut self, text: &str) -> Result<Vec<Frame>, GatewayError> {
+    fn feed(&mut self, bytes: &[u8]) -> Result<Vec<Frame>, GatewayError> {
         if self.saw_end {
             return Ok(Vec::new());
         }
         let mut frames = Vec::new();
-        for event in self.scanner.push(text) {
+        for event in self.scanner.push(bytes) {
             match event {
                 TabbitEvent::Delta(delta) => {
                     self.content.push_str(&delta);
@@ -451,20 +551,17 @@ async fn drive_stream(
         let bytes = item.map_err(|error| {
             GatewayError::with_status(502, format!("Tabbit 上游流读取失败：{error}"))
         })?;
-        let text = String::from_utf8_lossy(&bytes);
-        let frames = converter.feed(&text)?;
+        let frames = converter.feed(&bytes)?;
         for frame in frames {
             let wire = frame.wire();
             if sender.send(Ok(Bytes::from(wire))).await.is_err() {
-                return Ok(());
+                return Err(GatewayError::with_status(499, "Tabbit 客户端断开连接"));
             }
         }
     }
-    for frame in converter.finish() {
-        let wire = frame.wire();
-        let _ = sender.send(Ok(Bytes::from(wire))).await;
+    if !converter.saw_end {
+        return Err(GatewayError::with_status(502, "Tabbit 上游流提前结束，未收到 finish/close/cancel"));
     }
-    let _ = sender.send(Ok(Bytes::from("")));
     Ok(())
 }
 
@@ -481,9 +578,8 @@ async fn aggregate(
         let bytes = item.map_err(|error| {
             GatewayError::with_status(502, format!("Tabbit 上游流读取失败：{error}"))
         })?;
-        let text = String::from_utf8_lossy(&bytes);
-        // 复用 feed 的事件解析，但只收内容（reasoning 单独记）
-        for event in converter.scanner.push(&text) {
+        // 等完整 SSE 帧到齐后再解码（reasoning 单独记）
+        for event in converter.scanner.push(&bytes) {
             match event {
                 TabbitEvent::Delta(delta) => {
                     converter.content.push_str(&delta);
@@ -508,6 +604,9 @@ async fn aggregate(
             }
         }
     }
+    if !converter.saw_end {
+        return Err(GatewayError::with_status(502, "Tabbit 上游流提前结束，未收到 finish/close/cancel"));
+    }
     let mut message = Map::new();
     message.insert("role".to_string(), json!("assistant"));
     message.insert("content".to_string(), json!(converter.content));
@@ -525,15 +624,23 @@ async fn aggregate(
     body.insert("model".to_string(), json!(model));
     body.insert("choices".to_string(), Value::Array(vec![Value::Object(choice)]));
     body.insert("system_fingerprint".to_string(), json!("tabbit"));
-    // 上游 SSE 不返回 usage（参考实现本地估算）：这里给字符数，调用方按需换算
-    body.insert(
-        "usage".to_string(),
-        json!({
-            "prompt_tokens": prompt.chars().count(),
-            "completion_tokens": converter.content.chars().count(),
-            "total_tokens": prompt.chars().count() + converter.content.chars().count(),
-        }),
-    );
+    // 上游 SSE 未可靠提供 token usage；以 CJK=1、其它字符每 4 字约 1 token 粗估。
+    let estimate = |text: &str| -> usize {
+        let mut latin = 0usize;
+        let mut cjk = 0usize;
+        for c in text.chars() {
+            if ('\u{4e00}'..='\u{9fff}').contains(&c) { cjk += 1; }
+            else { latin += 1; }
+        }
+        cjk + latin.div_ceil(4)
+    };
+    let prompt_tokens = estimate(prompt);
+    let completion_tokens = estimate(&converter.content);
+    body.insert("usage".to_string(), json!({
+        "prompt_tokens": prompt_tokens,
+        "completion_tokens": completion_tokens,
+        "total_tokens": prompt_tokens + completion_tokens,
+    }));
     Ok(ForwardOutcome::Completion { body: Value::Object(body) })
 }
 
@@ -583,4 +690,37 @@ pub async fn run_chat_with_busy_retry(
         }
     }
     Err(last_error.unwrap_or_else(|| GatewayError::with_status(502, "Tabbit 会话持续忙碌，重试已耗尽")))
+}
+
+
+#[cfg(test)]
+mod parity_tests {
+    use super::{build_prompt, excerpt, SseScanner, TabbitEvent, PROMPT_BUDGET};
+    use serde_json::json;
+
+    #[test]
+    fn long_history_has_budget_and_preserves_latest_turn() {
+        let messages = json!([
+            {"role": "system", "content": "Always use Rust"},
+            {"role": "user", "content": "first ".repeat(8000)},
+            {"role": "assistant", "content": "middle ".repeat(3000)},
+            {"role": "user", "content": "LATEST QUESTION"}
+        ]);
+        let prompt = build_prompt(Some(&messages));
+        assert!(prompt.chars().count() <= PROMPT_BUDGET);
+        assert!(prompt.contains("Always use Rust"));
+        assert!(prompt.contains("LATEST QUESTION"));
+        assert_eq!(excerpt("hello", 10), "hello");
+    }
+
+    #[test]
+    fn sse_utf8_split_and_crlf_are_decoded() {
+        let wire = "event: message_chunk\r\ndata: {\"content\":\"中文完整\"}\r\n\r\n";
+        let bytes = wire.as_bytes();
+        let middle = bytes.iter().position(|x| *x == 0xe4).unwrap_or(0) + 1;
+        let mut parser = SseScanner::default();
+        assert!(parser.push(&bytes[..middle]).is_empty());
+        let events = parser.push(&bytes[middle..]);
+        assert!(matches!(events.first(), Some(TabbitEvent::Delta(s)) if s == "中文完整"));
+    }
 }

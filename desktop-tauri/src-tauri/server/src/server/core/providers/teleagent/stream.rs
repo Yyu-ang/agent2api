@@ -15,11 +15,9 @@
 //!   - `permission.asked` / `question.asked`：上游在等**用户确认**
 //!     （授权访问目录/执行命令、或向用户提问）。
 //!
-//! ── 待确认事件的处置（与原实现不同，有意为之）─────────────────
-//! 原实现把这类事件登记后**继续等**（它的机器人场景有人在另一端点确认）。
-//! 网关场景没有可确认的人：一直等只会拖到超时。**这里直接中断本轮**，
-//! 给客户端一个可读错误（说明 TeleAgent 在等用户确认、网关无法代答），
-//! 而不是静默返回空内容或让客户端干等两分钟。
+//! ── 待确认事件 ─────────────────────────────────────────────
+//! 当前会话的 permission/question 事件写入受保护的人工确认队列，后台监听
+//! 持续等待用户在管理页/API 回复后继续执行，绝不自动授权；10 分钟超时兜底。
 //!
 //! ── 与 Python 实现的两处传输层差异 ────────────────────────────
 //!   - Python 用裸 socket 手写 HTTP（要自己剥 chunked 编码）；这里走
@@ -40,9 +38,9 @@ use crate::server::errors::GatewayError;
 use super::auth::{base_http_url, sign_headers, sign_headers_with_key};
 
 /// 事件流监听超时（原实现 `SSEListener` 默认 120 秒）
-const LISTEN_TIMEOUT_MS: u64 = 120_000;
+const LISTEN_TIMEOUT_MS: u64 = 10 * 60_000;
 /// 流空闲兜底（与 kuku 的 `STREAM_IDLE_MS` 同值；编排层另有统一 idle_guard）
-const STREAM_IDLE_MS: u64 = 120_000;
+const STREAM_IDLE_MS: u64 = 10 * 60_000;
 
 /// 一条已解析的上游事件。
 enum TeleAgentEvent {
@@ -53,14 +51,14 @@ enum TeleAgentEvent {
     /// 上游错误（message/part 的 error）
     Error(String),
     /// 上游在等待用户确认（网关无法代答，中断本轮）
-    NeedConfirmation(String),
+    NeedConfirmation { kind: &'static str, properties: Value },
 }
 
 /// 按 `\n\n` 分帧、逐帧取 `data:` 前缀 JSON 的解析器（与 kuku 的
 /// `SseScanner` 同构；super-agent 的帧也是标准 SSE）。
 #[derive(Default)]
 struct SseScanner {
-    buffer: String,
+    buffer: Vec<u8>,
     /// 已登记的 assistant 消息 id（`message.updated`）
     assistant_msg_ids: Vec<String>,
     /// 已登记的 assistant 文本 part id（`message.part.updated`）
@@ -77,26 +75,32 @@ impl SseScanner {
         }
     }
 
-    fn push(&mut self, text: &str) -> Vec<TeleAgentEvent> {
-        self.buffer.push_str(text);
+    fn push(&mut self, bytes: &[u8]) -> Vec<TeleAgentEvent> {
+        self.buffer.extend_from_slice(bytes);
         let mut events = Vec::new();
-        while let Some(split_at) = self.buffer.find("\n\n") {
-            let raw: String = self.buffer.drain(..=split_at + 1).collect();
-            for line in raw.split('\n') {
-                let Some(payload) = line.strip_prefix("data:") else {
-                    continue;
-                };
-                let payload = payload.trim();
-                if payload.is_empty() || payload == "[DONE]" {
-                    continue;
-                }
-                let Ok(parsed) = serde_json::from_str::<Value>(payload) else {
-                    continue;
-                };
-                if let Some(event) = self.event_from_json(&parsed) {
-                    events.push(event);
+        // 完整 SSE 帧到齐后才解码，避免 UTF-8 汉字跨网络 chunk 损坏。
+        while let Some((at, width)) = {
+            let crlf = self.buffer.windows(4).position(|w| w == b"\r\n\r\n").map(|i| (i, 4));
+            let lf = self.buffer.windows(2).position(|w| w == b"\n\n").map(|i| (i, 2));
+            match (crlf, lf) {
+                (Some(a), Some(b)) => Some(if a.0 < b.0 { a } else { b }),
+                (Some(a), None) => Some(a),
+                (None, Some(b)) => Some(b),
+                _ => None,
+            }
+        } {
+            let raw: Vec<u8> = self.buffer.drain(..at + width).collect();
+            let Ok(text) = String::from_utf8(raw) else { continue };
+            let mut payload_lines = Vec::new();
+            for line in text.lines() {
+                if let Some(payload) = line.trim_end_matches('\r').strip_prefix("data:") {
+                    payload_lines.push(payload.trim_start());
                 }
             }
+            let payload = payload_lines.join("\n");
+            if payload.is_empty() || payload == "[DONE]" { continue; }
+            let Ok(parsed) = serde_json::from_str::<Value>(&payload) else { continue };
+            if let Some(event) = self.event_from_json(&parsed) { events.push(event); }
         }
         events
     }
@@ -109,6 +113,13 @@ impl SseScanner {
         // 只关注本次会话的事件（原实现 `_handle_event` 开头的过滤）
         let event_session = props.get("sessionID").and_then(Value::as_str).unwrap_or("");
         if !event_session.is_empty() && event_session != self.session_id {
+            return None;
+        }
+        // 确认/结束事件是会话级控制信号：缺少归属也不可当成本会话事件。
+        // 全局 SSE 同时服务多个 TeleAgent 任务，不能跨会话关联审批。
+        if matches!(etype, "permission.asked" | "question.asked" | "session.status")
+            && event_session != self.session_id
+        {
             return None;
         }
         match etype {
@@ -193,25 +204,8 @@ impl SseScanner {
                 None
             }
             "permission.asked" | "question.asked" => {
-                let description = props
-                    .get("description")
-                    .or_else(|| props.get("prompt"))
-                    .and_then(Value::as_str)
-                    .unwrap_or("")
-                    .to_string();
-                let kind = if etype == "permission.asked" {
-                    "权限确认"
-                } else {
-                    "问题确认"
-                };
-                Some(TeleAgentEvent::NeedConfirmation(format!(
-                    "TeleAgent 请求用户{kind}（网关无法代答）：{}",
-                    if description.is_empty() {
-                        "（无描述）"
-                    } else {
-                        description.as_str()
-                    }
-                )))
+                let kind = if etype == "permission.asked" { "permission" } else { "question" };
+                Some(TeleAgentEvent::NeedConfirmation { kind, properties: props.clone() })
             }
             _ => None,
         }
@@ -245,10 +239,12 @@ struct TeleAgentStream {
     saw_end: bool,
     /// 非流式聚合用（也用于判断「发过内容就不再改判错误」）
     content: String,
+    tools_enabled: bool,
+    key: String,
 }
 
 impl TeleAgentStream {
-    fn new(model: &str, session_id: &str) -> Self {
+    fn new(model: &str, session_id: &str, tools_enabled: bool, key: &str) -> Self {
         Self {
             id: format!("chatcmpl-tg{}", crate::server::logging::now_ms()),
             created: crate::server::logging::now_ms() / 1000,
@@ -256,24 +252,38 @@ impl TeleAgentStream {
             scanner: SseScanner::new(session_id),
             saw_end: false,
             content: String::new(),
+            tools_enabled,
+            key: key.to_string(),
         }
     }
 
     /// 喂一段字节，返回该段触发的帧；`Err` = 中断本轮（上游错误/待确认）。
-    fn feed(&mut self, text: &str) -> Result<Vec<Frame>, GatewayError> {
+    fn feed(&mut self, bytes: &[u8]) -> Result<Vec<Frame>, GatewayError> {
         if self.saw_end {
             return Ok(Vec::new());
         }
         let mut frames = Vec::new();
-        for event in self.scanner.push(text) {
+        for event in self.scanner.push(bytes) {
             match event {
                 TeleAgentEvent::Delta(delta) => {
                     self.content.push_str(&delta);
-                    frames.push(self.chunk(delta, None));
+                    // 工具请求模式先缓冲，解析完成后再输出，避免泄漏伪协议标记。
+                    if !self.tools_enabled { frames.push(self.chunk(delta, None)); }
                 }
                 TeleAgentEvent::Done => {
+                    // 等待人工确认时上游可能暂时进入 idle，不能提前关闭回答流。
+                    if super::confirmations::has_pending(&self.scanner.session_id) { continue; }
                     self.saw_end = true;
-                    frames.push(self.chunk(String::new(), Some("stop")));
+                    let mut finish = "stop";
+                    if self.tools_enabled {
+                        let (clean, calls) = parse_tool_calls(&self.content);
+                        if !clean.is_empty() { frames.push(self.chunk(clean, None)); }
+                        if !calls.is_empty() {
+                            finish = "tool_calls";
+                            frames.push(self.tool_chunk(calls));
+                        }
+                    }
+                    frames.push(self.chunk(String::new(), Some(finish)));
                     frames.push(Frame::Done);
                 }
                 TeleAgentEvent::Error(message) => {
@@ -287,10 +297,14 @@ impl TeleAgentStream {
                     frames.push(self.chunk(String::new(), Some("stop")));
                     frames.push(Frame::Done);
                 }
-                TeleAgentEvent::NeedConfirmation(message) => {
-                    crate::server::logging::verbose("[TeleAgent]", &message);
-                    self.saw_end = true;
-                    return Err(GatewayError::with_status(502, message));
+                TeleAgentEvent::NeedConfirmation { kind, properties } => {
+                    super::confirmations::record(
+                        kind, &self.scanner.session_id, &properties, &self.key,
+                    )?;
+                    crate::server::logging::log(
+                        "[TeleAgent]", "上游等待人工确认，可通过 /api/teleagent/confirmations 处理",
+                    );
+                    // 不批准也不中断原会话；继续监听直到用户在受保护的管理 API 里回复。
                 }
             }
         }
@@ -304,6 +318,24 @@ impl TeleAgentStream {
         }
         self.saw_end = true;
         vec![self.chunk(String::new(), Some("stop")), Frame::Done]
+    }
+
+    fn tool_chunk(&self, calls: Vec<Value>) -> Frame {
+        // OpenAI Chat Completions 的流式 tool_calls 每项都需要 index；
+        // 非流式 message.tool_calls 则保持普通 id/type/function 结构。
+        let indexed = calls.into_iter().enumerate().map(|(index, mut call)| {
+            if let Value::Object(ref mut object) = call {
+                object.insert("index".to_string(), json!(index));
+            }
+            call
+        }).collect::<Vec<_>>();
+        Frame::Chunk(json!({
+            "id": self.id,
+            "object": "chat.completion.chunk",
+            "created": self.created,
+            "model": self.model,
+            "choices": [{"index": 0, "delta": {"tool_calls": indexed}, "finish_reason": null}]
+        }))
     }
 
     fn chunk(&mut self, delta: String, finish_reason: Option<&str>) -> Frame {
@@ -418,6 +450,8 @@ pub async fn drive_stream(
     response: reqwest::Response,
     model: &str,
     session_id: &str,
+    tools_enabled: bool,
+    key: &str,
     sender: &tokio::sync::mpsc::Sender<Result<Bytes, std::io::Error>>,
 ) -> Result<(), GatewayError> {
     let source = response
@@ -427,18 +461,17 @@ pub async fn drive_stream(
         Box::pin(source),
         std::time::Duration::from_millis(STREAM_IDLE_MS),
     );
-    let mut stream = TeleAgentStream::new(model, session_id);
+    let mut stream = TeleAgentStream::new(model, session_id, tools_enabled, key);
     while let Some(item) = source.next().await {
         let chunk = item.map_err(|error| {
             GatewayError::with_status(502, format!("TeleAgent 上游流式传输中断: {error}"))
         })?;
-        let text = String::from_utf8_lossy(&chunk).to_string();
-        for frame in stream.feed(&text)? {
+        for frame in stream.feed(&chunk)? {
             send_frame(sender, &frame).await?;
         }
     }
-    for frame in stream.finish() {
-        send_frame(sender, &frame).await?;
+    if !stream.saw_end {
+        return Err(GatewayError::with_status(502, "TeleAgent 上游流提前结束，缺少 session.status=idle"));
     }
     Ok(())
 }
@@ -458,6 +491,8 @@ pub async fn aggregate(
     response: reqwest::Response,
     client_model: &str,
     session_id: &str,
+    tools_enabled: bool,
+    key: &str,
 ) -> Result<crate::server::core::upstream::ForwardOutcome, GatewayError> {
     let source = response
         .bytes_stream()
@@ -466,26 +501,32 @@ pub async fn aggregate(
         Box::pin(source),
         std::time::Duration::from_millis(STREAM_IDLE_MS),
     );
-    let mut stream = TeleAgentStream::new(client_model, session_id);
+    let mut stream = TeleAgentStream::new(client_model, session_id, tools_enabled, key);
     while let Some(item) = source.next().await {
         let chunk = item.map_err(|error| {
             GatewayError::with_status(502, format!("TeleAgent 上游流式传输中断: {error}"))
         })?;
-        let text = String::from_utf8_lossy(&chunk).to_string();
-        let _ = stream.feed(&text)?;
+        let _ = stream.feed(&chunk)?;
     }
-    let _ = stream.finish();
-    let content = stream.content.clone();
+    if !stream.saw_end {
+        return Err(GatewayError::with_status(502, "TeleAgent 上游流提前结束，缺少 session.status=idle"));
+    }
+    let (content, tool_calls) = if tools_enabled {
+        parse_tool_calls(&stream.content)
+    } else {
+        (stream.content.clone(), Vec::new())
+    };
     let id = stream.id.clone();
     let created = stream.created;
     let model = stream.model.clone();
     let mut message = Map::new();
     message.insert("role".to_string(), json!("assistant"));
-    message.insert("content".to_string(), json!(content));
+    message.insert("content".to_string(), if content.is_empty() && !tool_calls.is_empty() { Value::Null } else { json!(content) });
+    if !tool_calls.is_empty() { message.insert("tool_calls".to_string(), json!(tool_calls)); }
     let mut choice = Map::new();
     choice.insert("index".to_string(), json!(0));
     choice.insert("message".to_string(), Value::Object(message));
-    choice.insert("finish_reason".to_string(), json!("stop"));
+    choice.insert("finish_reason".to_string(), json!(if tool_calls.is_empty() { "stop" } else { "tool_calls" }));
     let mut body = Map::new();
     body.insert("id".to_string(), json!(id));
     body.insert("object".to_string(), json!("chat.completion"));
@@ -502,18 +543,108 @@ pub fn stream_outcome(
     response: reqwest::Response,
     model: &str,
     session_id: &str,
+    tools_enabled: bool,
+    key: &str,
+    conversation: Option<tokio::sync::OwnedMutexGuard<super::session::Conversation>>,
+    fingerprints: Vec<String>,
 ) -> crate::server::core::upstream::ForwardOutcome {
     let (sender, receiver) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(64);
     let model = model.to_string();
     let session_id = session_id.to_string();
+    let key = key.to_string();
     crate::spawn_task(async move {
-        let outcome = drive_stream(response, &model, &session_id, &sender).await;
+        let mut conversation = conversation;
+        let outcome = drive_stream(response, &model, &session_id, tools_enabled, &key, &sender).await;
+        if let Some(state) = conversation.as_mut() {
+            if outcome.is_ok() { state.commit(session_id.clone(), fingerprints); }
+            else { state.reset(); }
+        }
         if let Err(error) = outcome {
             crate::server::logging::verbose("[TeleAgent]", &format!("对话流处理中断：{}", error.message));
+            let _ = sender.send(Err(std::io::Error::other(error.message))).await;
         }
     });
     crate::server::core::upstream::ForwardOutcome::Stream {
         status: 200,
         stream: Box::new(ReceiverStream::new(receiver)),
     }
+}
+
+
+/// 将 TeleAgent 文本工具协议转为 OpenAI tool_calls。
+/// 解析完整的 JSON 标记片段，支持嵌套 arguments 对象。
+fn parse_tool_calls(text: &str) -> (String, Vec<Value>) {
+    const START: &str = "[TOOL_CALL]";
+    const END: &str = "[/TOOL_CALL]";
+    let mut rest = text;
+    let mut clean = String::new();
+    let mut calls = Vec::new();
+    while let Some(start) = rest.find(START) {
+        clean.push_str(&rest[..start]);
+        let tail = &rest[start + START.len()..];
+        let Some(end) = tail.find(END) else {
+            clean.push_str(&rest[start..]);
+            return (clean.trim().to_string(), calls);
+        };
+        let fragment = tail[..end].trim();
+        if let Ok(call) = serde_json::from_str::<Value>(fragment) {
+            if let Some(name) = call.get("name").and_then(Value::as_str).filter(|s| !s.trim().is_empty()) {
+                let args = call.get("arguments").cloned().unwrap_or_else(|| json!({}));
+                let args_text = match args { Value::String(s) => s, other => other.to_string() };
+                calls.push(json!({
+                    "id": format!("call_{}", calls.len()),
+                    "type": "function",
+                    "function": {"name": name, "arguments": args_text}
+                }));
+            } else { clean.push_str(&rest[start..start + START.len() + end + END.len()]); }
+        } else { clean.push_str(&rest[start..start + START.len() + end + END.len()]); }
+        rest = &tail[end + END.len()..];
+    }
+    clean.push_str(rest);
+    (clean.trim().to_string(), calls)
+}
+
+#[cfg(test)]
+mod parity_tests {
+    use super::parse_tool_calls;
+    #[test]
+    fn nested_tool_arguments_and_plain_answer() {
+        let (clean, calls) = parse_tool_calls(r#"before [TOOL_CALL]{"name":"run","arguments":{"payload":{"x":1}}}[/TOOL_CALL] after"#);
+        assert_eq!(clean, "before  after");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0]["function"]["name"], "run");
+        assert_eq!(calls[0]["function"]["arguments"], r#"{"payload":{"x":1}}"#);
+        let (text, calls) = parse_tool_calls("normal answer");
+        assert_eq!(text, "normal answer");
+        assert!(calls.is_empty());
+    }
+
+    #[test]
+    fn undecodable_tool_call_is_not_erased() {
+        let (text, calls) = parse_tool_calls("[TOOL_CALL]oops[/TOOL_CALL]");
+        assert_eq!(text, "[TOOL_CALL]oops[/TOOL_CALL]");
+        assert!(calls.is_empty());
+    }
+
+    #[test]
+    fn stream_tool_calls_include_index() {
+        let stream=super::TeleAgentStream::new("NewApi/chat-pro","test-session",true,"unit-test-key");
+        let (_, calls)=parse_tool_calls(r#"[TOOL_CALL]{"name":"search","arguments":{"q":"a"}}[/TOOL_CALL]"#);
+        let frame=stream.tool_chunk(calls);
+        let value=match frame { super::Frame::Chunk(v)=>v, _=>panic!("expected chunk") };
+        assert_eq!(value["choices"][0]["delta"]["tool_calls"][0]["index"],0);
+    }
+
+
+    #[test]
+    fn confirmation_events_require_exact_session_id() {
+        let mut scanner = super::SseScanner::new("mine");
+        let foreign = serde_json::json!({"payload":{"type":"permission.asked","properties":{"id":"foreign","sessionID":"other"}}});
+        let missing = serde_json::json!({"payload":{"type":"permission.asked","properties":{"id":"missing"}}});
+        assert!(scanner.event_from_json(&foreign).is_none());
+        assert!(scanner.event_from_json(&missing).is_none());
+        let own = serde_json::json!({"payload":{"type":"permission.asked","properties":{"id":"own","sessionID":"mine"}}});
+        assert!(matches!(scanner.event_from_json(&own), Some(super::TeleAgentEvent::NeedConfirmation{..})));
+    }
+
 }

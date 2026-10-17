@@ -149,7 +149,13 @@ impl ProviderAdapter for TeleAgentAdapter {
     /// ——「获取模型」弹窗不显示无意义的账号下拉
     /// （与 [`Self::refresh_models`] 的参数配对，见 trait 文档）。
     fn refresh_uses_account(&self) -> bool {
-        false
+        true
+    }
+
+    /// 会话式转发需对认证失败分类，不能落入 trait 默认 Fatal 分支。
+    fn classify_conversation_error(&self, error: &GatewayError) -> UpstreamErrorClass {
+        let status = error.status_code.clamp(0, u16::MAX as i32) as u16;
+        self.classify_error(status, &serde_json::json!({"message": error.message}))
     }
 
     /// 凭证：session key。

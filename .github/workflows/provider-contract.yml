@@ -1,0 +1,30 @@
+name: Provider protocol regressions
+
+on:
+  pull_request:
+    branches: [beta]
+    paths:
+      - '.github/workflows/provider-contract.yml'
+      - 'desktop-tauri/src-tauri/server/src/server/core/providers/tabbit/**'
+      - 'desktop-tauri/src-tauri/server/src/server/core/providers/teleagent/**'
+      - 'desktop-tauri/src-tauri/server/src/server/core/account_store/tabbit_accounts.rs'
+  push:
+    branches:
+      - 'fix/provider-feature-parity-20261014'
+
+permissions:
+  contents: read
+
+jobs:
+  provider-contracts:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: desktop-tauri/src-tauri -> ../../target
+      - name: Compile gateway
+        run: cargo check --manifest-path desktop-tauri/src-tauri/server/Cargo.toml
+      - name: Verify provider regression tests
+        run: cargo test --manifest-path desktop-tauri/src-tauri/server/Cargo.toml --lib parity_tests

@@ -37,8 +37,12 @@ pub(super) async fn query_usage(
         credentials.user_id
     );
     let headers = super::protocol::base_headers(region, &credentials, "/");
-    let value =
-        super::http::get_json_value(&url, &headers, None, Some(BALANCE_TIMEOUT_MS)).await?;
+    let account = store.tabbit_account_record(region.provider_id(), account_id);
+    let resolution = crate::server::core::proxies::resolve_account_proxy(
+        account.as_ref().and_then(|record| record.get("proxy")),
+    );
+    let proxy = resolution.as_ref().and_then(|item| item.resolved());
+    let value = super::http::get_json_value(&url, &headers, proxy, Some(BALANCE_TIMEOUT_MS)).await?;
     // 宽松读取：member_level / usage_percentage / 周期（字段名以实测为准，
     // 读不到给空串，不伪造）
     let member_level = value
