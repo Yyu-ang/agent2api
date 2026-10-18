@@ -16,17 +16,20 @@ description: Agent2API（workbuddy）仓库的协作与发版规范 —— 分�
 
 一次发版里两条同时适用：既要有版本号的确认，也要有日志的确认；用户说「继续」之后才动手。
 
-## 1. 分支落脚点：日常只碰 beta，发版才动 main
+## 1. 分支落脚点：main 是上游镜像，日常只碰 beta
 
 | 分支 | 角色 | 什么时候动它 |
 |---|---|---|
-| `beta` | 集成分支（默认落脚点） | 日常修改、合并 PR、解冲突 —— 一律先到这里 |
-| `main` | 发版分支 | 只在构建发版时：切 main、把 beta 合进来、打 tag |
+| `main` | 上游镜像 | 只跟上游走：`git fetch upstream` → `git reset --hard upstream/main` → 推。不在上面直接开发，不合任何 PR 进来 |
+| `beta` | 集成分支（默认落脚点） | 日常修改、合并 PR、解冲突、发版 —— 一律先到这里；内容 = 上游 + fork 独有工作 |
 
-- **合并 PR 时 base 选 `beta`**，不要选 `main`。合进 `main` 等于把还没发布的改动提前塞进发版分支；之后还得反过来把 main 合回 beta，平白多一次合并提交、多一次冲突机会。已经把 PR 开成 base=main 的，先在 PR 页面把 base 改成 `beta` 再合。
+（2026-10-18 起的新模型：上游复活为 `Agent2API/agent2api` 后，`main` 改为纯净的上游镜像，不再是发版分支。）
+
+- **合并 PR 时 base 选 `beta`**，不要选 `main`。
 - **本地改动也提交到 `beta`**（写代码、改文档、解冲突都算），推 `origin/beta`；合并结果的核对、构建自检都在 beta 上做完。
-- **只有正式发版才切 `main`**：`git switch main` → 把 beta 合进来 → 写发布提交、推 main、打 tag；tag 必须落在 `main` 上。发完版 beta 再把 main 合回来，两边保持一致。
-- **不要自作主张选落脚分支**：用户没说要发版，就不要往 `main` 提交 / 推送，也不要把 PR 的 base 改成 `main`。
+- **上游同步**：上游更新后，在 beta 上做 union merge（`git merge upstream/main`，冲突两边保留，`ui/islands/ui.js` / `ui/i18n/**` 等构建产物从源重建不手改），`cargo check` 通过后推 beta。`main` 的同步是独立的 `reset --hard`，**不要把 beta 合进 main**。
+- **发版 tag 一律落在 `beta` 上**（正式版也不例外 —— main 必须保持纯净的上游镜像）。第 5 节里「tag 落在 main 上」是旧模型的写法，现已作废。
+- **代理不要自作主张选落脚分支**：用户没说要发版，就不要打 tag / 推 tag，也不要把 PR 的 base 改成 `main`。
 - beta 版（预发布）是唯一例外：不切 `main`，tag 直接落在 `beta` 分支自己身上（见第 6 节）。
 
 ## 2. 合并 PR：保留贡献者署名
