@@ -414,6 +414,26 @@ impl AccountStore {
             .map(|record| credential_of_record(&record))
     }
 
+    /// 该自定义提供商下**全部**账号（含禁用）的 `(账号 id, apiKey 明文, 是否启用)`，
+    /// 按优先级升序。
+    ///
+    /// 只服务启动期的 OpenCode2API 桥（`opencode2api_bridge::bootstrap`）：它要
+    /// 判断「当前 key 已登记 / 旧 key 需要轮换 / 需要停用的残留旧 key」，
+    /// 而 `accounts_for_provider` 只给启用账号、公开形态又刻意不含 key。
+    /// **返回值含 apiKey 明文，绝不进任何 HTTP 响应。**
+    pub fn custom_account_keys(&self, provider_id: &str) -> Vec<(String, String, bool)> {
+        let _guard = self.guard();
+        let mut records = self.records_for_provider(&_guard, provider_id.trim());
+        records.sort_by_key(StoredAccount::order_key);
+        records
+            .iter()
+            .map(|record| {
+                let credential = credential_of_record(record);
+                (credential.account_id, credential.api_key, record.enabled())
+            })
+            .collect()
+    }
+
     /// 改一条自定义账号的**凭证**：`apiKey`（可清除）与 `noAuth`（无需鉴权
     /// 标记）。返回变更说明（供界面提示与日志），没有任何变化时返回空表。
     ///

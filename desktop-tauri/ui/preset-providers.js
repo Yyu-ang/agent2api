@@ -197,6 +197,18 @@
       hint: wbI18n.t('小米 MiMo Token Plan 套餐（新加坡站）'),
     },
     {
+      // Connect to the independent opencode2api Go gateway on the host.
+      // This is NOT the direct OpenCode Zen/Go preset below; its API Key is
+      // opencode2api's local server key, not a Zen or Go upstream key.
+      // name 必须与后端 opencode2api_bridge::NAME 逐字一致：Docker sidecar
+      // 自动注册的那一家靠这个字面量认领本卡（图标、归入「预置 API」段、
+      // 点卡 = 给已建的那家加账号），否则 Docker 面板里点卡会再建一家指向
+      // 容器内 127.0.0.1:8080 的不通的提供商。
+      key: 'opencode2api-local', name: 'OpenCode2API', icon: 'opencode-go.png',
+      protocol: P.openai, baseUrl: 'http://127.0.0.1:8080/v1',
+      hint: wbI18n.t('连接独立运行的 jasonxu114514/opencode2api（默认监听 127.0.0.1:8080）。API Key 填它的 server_keys 本地网关 Key，而非 Zen/Go Key；模型列表从它的 /v1/models 获取。Docker 部署启用 sidecar 后会自动注册这一家，无需手动添加'),
+    },
+    {
       key: 'opencode-go', name: 'OpenCode Go', icon: 'opencode-go.png',
       // Go 面与免费档的要求不同：网关按端点自动补上游要求的会话头
       // （x-opencode-session）与产品 UA，**不需要开伪装开关**（那是 Zen

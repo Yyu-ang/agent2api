@@ -76,6 +76,7 @@ Agent2API 把多家 AI 桌面客户端里已登录的账号接到一起，共用
 | Antigravity（Google，Gemini） | ✓ | ✓ | ✓ | — | — | — |
 | OfficeAce（华为云果办 / OfficeClaw） | ✓ | ✓ | ✓ | ✓ | ✓ | — |
 | 自定义提供商 | ✓ | — | ✓ | — | — | — |
+| OpenCode2API（可选 sidecar） | ✓ | — | ✓ | —（见上游 WebUI） | — | — |
 
 > 注：模型列表的 ✓ 表示支持在线自动拉取，部分平台另有内置静态表兜底；ZCode 仅有内置静态表。Token 续期列 ✗ 表示该平台没有可用的续期接口（账号在有效期内不受影响）。Qoder 签到仅中国版可用。
 
@@ -127,6 +128,39 @@ print(resp.choices[0].message.content)
 
 默认只监听 `127.0.0.1`。开启「设置 → 通用 → 局域网访问」后改听所有网卡，局域网设备把 API 地址指向本机 IP 即可共用（界面会给出完整地址）。出于安全，开启前必须注册面板管理员：管理接口要求管理员会话或网关 Key，无可用 Key 时转发接口同样拒绝服务（开启流程会自动补一把「默认」Key）；也可选择同时开放网页面板（默认关闭）。改动重启生效。
 
+---
+
+## OpenCode2API 可选嵌入（独立 Sidecar）
+
+支持将 [jasonxu114514/opencode2api](https://github.com/jasonxu114514/opencode2api) 作为**独立 Go 服务**接入本项目的统一 OpenAI 兼容网关；保留上游 Zen/Go Key 池、`sota`/`sweet` 路由、模型发现与管理界面，不把 GPLv3 上游源码合入 Rust/Tauri 主程序。
+
+```bash
+node scripts/opencode2api-init.mjs
+docker compose -f docker-compose.yml -f docker-compose.opencode2api.yml up -d --build
+```
+
+- 不需要 `--env-file`：桥接 Key 通过 overlay 里的服务级 `env_file: .env.opencode2api` 注入 Agent2API 容器，原有 `.env`（管理员、面板端口、人机验证等）照常生效。
+- 初始化时可通过环境变量 `OPENCODE2API_ZEN_KEYS` / `OPENCODE2API_GO_KEYS` 输入上游 Key；没有上游 Key 时默认启用上游的匿名模式（`OPENCODE2API_ANONYMOUS=0/1` 可显式指定）。
+- 上游种子配置（含 Zen/Go Key 与 WebUI 初始明文密码）写在 `integrations/opencode2api/.secrets/config.json`，**不在 `./data` 里**，Agent2API 容器看不到它；只由一次性的 `opencode2api-seed` 容器以上游镜像内的非 root 用户身份导入 sidecar 的状态卷。**首次启动成功后建议删除这份明文**（sidecar 已有自己的副本，WebUI 密码在副本里会被哈希化）；`.env.opencode2api` 要保留。
+- 默认只公开 Agent2API 的 `3065/v1` 接口，OpenCode2API API 仅 Docker 内可访问，其 WebUI 仅监听宿主机 `127.0.0.1:18081`。
+- sidecar 是可选组件：它没就绪或不健康时 Agent2API 照常启动，后台按退避重试拉取模型列表，就绪后自动填入。
+- 镜像默认锁定在测试过的 `v1.4.1`（带 digest），升级时在 `.env` 里设 `OPENCODE2API_IMAGE`。
+
+[部署步骤、功能边界与故障排查](./integrations/opencode2api/README.md)。桌面端还提供「OpenCode2API」手动接入预置项（连本机 `127.0.0.1:8080`），但**未将 Go 二进制打包进安装程序**。
+
+### OpenCode Zen/Go 原生卡 vs OpenCode2API sidecar 怎么选
+
+| | OpenCode Zen / OpenCode Go 预置卡（原生） | OpenCode2API sidecar |
+| --- | --- | --- |
+| 部署 | 添加账号即用，桌面端与 Docker 都行 | 额外跑一个容器（或桌面端自行运行上游二进制） |
+| 多 Key | 每把 Key 一个账号：按 Key 看余额（Go 三个窗口）、按 Key 冷却与统计 | 整个 Key 池在 Agent2API 里只算**一个账号**；按 Key 的额度与统计去上游 WebUI 看 |
+| 轮换与容错 | Agent2API 自己的多账号轮换、429 换号、出网代理池 | 上游的 `sota`/`sweet` 粘性轮换组、免费模型可用性探测与自动下架、按模型走原生协议 |
+| 余额 | Go 卡支持 | 不显示（上游额度接口需要管理员会话） |
+
+一般用户直接用原生卡即可；需要 `sota`/`sweet` 轮换组或上游的免费模型探测时再上 sidecar。**两者不要同时接同一批 Key**，否则同一份额度会被两条路线重复调度。
+
+---
+
 ## 🐳 Docker 部署
 
 ```bash
@@ -160,6 +194,8 @@ services:
 | `AGENT2API_HOST` / `AGENT2API_PROXY_PORT` | 监听地址（默认 `0.0.0.0`）/ 端口（默认 `3065`） |
 | `AGENT2API_ALLOW_NO_KEY` | 置 `1` 关闭 fail-closed（未配 Key 也放行 `/v1`，仅限纯内网） |
 | `AGENT2API_CAPTCHA_ENABLED` | 登录页人机验证：默认 `1` 开启，`0` 关闭 |
+| `AGENT2API_OPENCODE2API_URL` + `AGENT2API_OPENCODE2API_KEY` | 可选 OpenCode2API sidecar 的地址与本地网关 Key（即上游 `server_keys` 之一）。两者都设时启动期自动登记名为「OpenCode2API」的自定义提供商；Docker overlay 会自动注入，一般无需手填。见上文「OpenCode2API 可选嵌入」 |
+| `OPENCODE2API_IMAGE` / `OPENCODE2API_WEBUI_PORT` | 仅 OpenCode2API overlay 使用：上游镜像（默认锁定 `v1.4.1` + digest）/ 上游 WebUI 的本机回环端口（默认 `18081`） |
 | `AGENT2API_SELF_UPDATE` | 容器内的更新入口：默认 `1` 开启（面板可「下载并更新」）；置 `0` 关闭，只走手动升级 |
 | `WORKBUDDY_UPDATE_REPO` + `WORKBUDDY_UPDATE_API_BASE` | 进阶：把「检查更新 / 下载更新」换成自建源。前者换仓库（默认跟上游 `aimod-cc/agent2api`，fork 后可改），后者换 API 根（默认 `https://api.github.com`，需返回与 GitHub 同形的 release JSON）。配了自建源后，下载白名单只额外放行**该源自己的域名**（按源的 scheme：配 `http://` 就允许明文下载，仅建议本地演练/内网镜像用）|
 
