@@ -583,6 +583,13 @@ impl ServerState {
             // 与 account_bootstrap 同一模式：待迁移旧数据没导入时跳过 ——
             // 跑了会把幂等标记打早，升级完成后由 `api::upgrade_api` 补调。
             request_stats.remap_model_dimension_once();
+        } else if std::env::var_os("AGENT2API_OPENCODE2API_URL").is_some() {
+            // 跳过要留痕：否则「配了 sidecar 却没出现提供商」无从排查。
+            // 升级导入完成后重启一次即会注册（bootstrap 本身幂等）。
+            logging::log(
+                "[OpenCode2API]",
+                "检测到待导入的旧版数据，本次启动跳过 sidecar 自动注册；完成数据导入后重启即可",
+            );
         }
 
         let state = Self {

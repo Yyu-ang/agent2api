@@ -358,6 +358,7 @@
   "这份额度走「活动套餐」通道：若转发时提示编码套餐已到期，": "",
   "这里填国内站（monkeycode-ai.com）的账号：请粘贴国内站的 session。国际站（monkeycode-ai.net）是另一家 provider、另一套账号，两边的凭证不通用。": "",
   "这里填国际站（monkeycode-ai.net）的账号：请粘贴国际站的 session。国内站（monkeycode-ai.com）是另一家 provider、另一套账号，两边的凭证不通用。": "",
+  "连接独立运行的 jasonxu114514/opencode2api（默认监听 127.0.0.1:8080）。API Key 填它的 server_keys 本地网关 Key，而非 Zen/Go Key；模型列表从它的 /v1/models 获取。Docker 部署启用 sidecar 后会自动注册这一家，无需手动添加": "",
   "选择 CatPaw 客户端的登录态文件 auth.json（Windows：C:\\Users\\<你的用户名>\\.meituan-catpaw\\auth.json；macOS / Linux：~/.meituan-catpaw/auth.json）。导入后凭证直接落在网关、可独立转发，不再依赖本机客户端。": "",
   "选择 Cline 客户端的登录态文件 providers.json（Windows：C:\\Users\\<你的用户名>\\.cline\\data\\settings\\providers.json；macOS / Linux：~/.cline/data/settings/providers.json）。导入后凭证直接落在网关、可独立转发，不再依赖本机客户端；这一条归入 {label}。": "",
   "选择 KukuAI 客户端的 Cookies 文件（%APPDATA%\\baidugenflowpro\\Network\\Cookies）：它是**二进制** SQLite 数据库（无扩展名，不是 JSON）。导入时读的是你选中文件的副本、不和运行中的客户端抢占用，因此**无需先关闭客户端**。导入后凭证直接落在网关、可独立转发。": "",

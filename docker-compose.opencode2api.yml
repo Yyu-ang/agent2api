@@ -1,49 +1,97 @@
 # Optional OpenCode2API integration: API stays private on the Compose network.
 #
 # One-time: node scripts/opencode2api-init.mjs
-# Start: docker compose --env-file .env.opencode2api \
-#   -f docker-compose.yml -f docker-compose.opencode2api.yml up -d --build
+# Start:    docker compose -f docker-compose.yml -f docker-compose.opencode2api.yml up -d --build
+#
+# No --env-file is needed: the bridge key reaches the Agent2API container via
+# the service-level env_file below, so your normal .env (AGENT2API_ADMIN_*,
+# AGENT2API_PANEL_PORT, captcha …) is still read for interpolation as usual.
 #
 # Externally visible model gateway remains port 3065 only. The upstream
 # management UI is loopback-only on port 18081, never exposed on LAN.
 # Upstream application/image: jasonxu114514/opencode2api (GPL-3.0-or-later).
+#
+# Image pin: v1.4.1 (2026-10-15), multi-arch index digest below. To upgrade,
+# set OPENCODE2API_IMAGE=ghcr.io/jasonxu114514/opencode2api:<tag>[@sha256:…]
+# in .env after testing the new release.
+x-opencode2api-image: &opencode2api-image
+  image: ${OPENCODE2API_IMAGE:-ghcr.io/jasonxu114514/opencode2api:v1.4.1@sha256:7b98bdecb6b3028c75405ded61358ac94501ec01a447038da5f1c83376d439b7}
+
 services:
   agent2api:
+    # The sidecar is optional: Agent2API must start even when the sidecar is
+    # unhealthy (no outbound network, no routable model …). The bridge keeps
+    # retrying model discovery in the background instead.
     depends_on:
       opencode2api:
-        condition: service_healthy
+        condition: service_started
+    env_file:
+      - .env.opencode2api   # AGENT2API_OPENCODE2API_KEY only; created by the init script
     environment:
       AGENT2API_OPENCODE2API_URL: http://opencode2api:8080/v1
-      AGENT2API_OPENCODE2API_KEY: ${OPENCODE2API_SERVER_KEY:?Run node scripts/opencode2api-init.mjs first}
+
+  # One-shot: copy the host seed into the state volume as the image's
+  # unprivileged user, mode 0600. Upstream's entrypoint drops to that user
+  # BEFORE it copies CONFIG_SEED_PATH, so it cannot read a 0600 seed owned by
+  # the host user (a bind mount keeps host uid/mode). Runs as root here with
+  # only the capabilities needed, and never touches an existing state copy.
+  opencode2api-seed:
+    <<: *opencode2api-image
+    user: "0:0"
+    entrypoint: ["/bin/sh", "-euc"]
+    command:
+      - |
+        state=/var/lib/opencode2api/config.json
+        if [ -f "$$state" ]; then
+          echo "opencode2api state already initialized; seed skipped"
+          exit 0
+        fi
+        if [ ! -f /run/seed/config.json ]; then
+          echo "missing integrations/opencode2api/.secrets/config.json: run node scripts/opencode2api-init.mjs" >&2
+          exit 1
+        fi
+        umask 077
+        cp /run/seed/config.json "$$state.tmp"
+        chown opencode2api:opencode2api "$$state.tmp" /var/lib/opencode2api
+        chmod 0600 "$$state.tmp"
+        mv "$$state.tmp" "$$state"
+        echo "opencode2api state initialized from seed"
+    network_mode: none
+    read_only: true
+    restart: "no"
+    cap_drop: [ALL]
+    cap_add: [CHOWN, DAC_OVERRIDE, FOWNER]
+    security_opt:
+      - no-new-privileges:true
+    volumes:
+      # A directory, not the file: deleting the plaintext seed after the first
+      # start (recommended) must not make Docker create a directory in its place.
+      - ./integrations/opencode2api/.secrets:/run/seed:ro
+      - opencode2api-state:/var/lib/opencode2api
 
   opencode2api:
-    image: ghcr.io/jasonxu114514/opencode2api:${OPENCODE2API_VERSION:-latest}
+    <<: *opencode2api-image
     restart: unless-stopped
     read_only: true
     security_opt:
       - no-new-privileges:true
+    depends_on:
+      opencode2api-seed:
+        condition: service_completed_successfully
     environment:
+      # Listen addresses come from the seeded config.json (0.0.0.0:8080 API,
+      # 0.0.0.0:8081 WebUI inside the container); no env override needed.
       CONFIG_PATH: /var/lib/opencode2api/config.json
-      CONFIG_SEED_PATH: /run/config/opencode2api.json
-      LISTEN_ADDRESS: 0.0.0.0:8080
-      WEBUI_LISTEN_ADDRESS: 0.0.0.0:8081
     # No published API port. The Agent2API container accesses port 8080 by
     # Docker DNS; users continue to call Agent2API at /v1 on port 3065.
     expose:
       - "8080"
     ports:
       - "127.0.0.1:${OPENCODE2API_WEBUI_PORT:-18081}:8081"
-    configs:
-      - source: opencode2api_seed
-        target: /run/config/opencode2api.json
     volumes:
       - opencode2api-state:/var/lib/opencode2api
     tmpfs:
       - /tmp
-
-configs:
-  opencode2api_seed:
-    file: ./data/opencode2api/config.json
 
 volumes:
   opencode2api-state:
