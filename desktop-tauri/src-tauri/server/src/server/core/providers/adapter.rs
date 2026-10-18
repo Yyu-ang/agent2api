@@ -1160,6 +1160,14 @@ pub fn adapter_for(kind: ProviderKind) -> &'static dyn ProviderAdapter {
         // （Basic 网关凭据；账号管理走手工导入 / 自助 OAuth，见
         // `officeace/mod.rs` 的模块头）
         ProviderKind::OfficeAce => &super::officeace::adapter::OFFICEACE_ADAPTER,
+        // TeleAgent（桌面 AI 助手）：会话式转发（建会话 → prompt_async →
+        // SSE 事件流，`is_stateful` 为 true，无账号概念，见 `teleagent/mod.rs`
+        // 的模块头）
+        ProviderKind::TeleAgent => &super::teleagent::TELEAGENT_ADAPTER,
+        // Tabbit 的两个地区是两个 provider、两个实例（同一份实现按地区参数化，
+        // 见 `tabbit::region::Region` 与 `tabbit::adapter` 的模块头）
+        ProviderKind::Tabbit => &super::tabbit::adapter::TABBIT_ADAPTER,
+        ProviderKind::TabbitIntl => &super::tabbit::adapter::TABBIT_INTL_ADAPTER,
         // OrcaTerm（腾讯云遨驰终端桌面客户端）：账号 / OAuth 续期 / 会话转发 /
         // 余额全部已接通（建会话 → assistant SSE，`is_stateful` 为 true，
         // 见 `orcaterm/mod.rs` 与 `orcaterm/adapter.rs` 的模块头）
@@ -1265,6 +1273,15 @@ pub fn implemented_kinds() -> Vec<ProviderKind> {
         // OfficeAce：远程目录（`GET {网关}/v1/models`）+ 有转发能力，
         // 进本列表才会被后台目录刷新调度
         ProviderKind::OfficeAce,
+        // TeleAgent：远程目录（`GET 127.0.0.1:4397/provider`，只收
+        // `source == "config"` 的已配置 provider）+ 会话式转发能力，
+        // 进本列表才会被后台目录刷新调度。无账号概念：刷新不走账号维度。
+        ProviderKind::TeleAgent,
+        // Tabbit 的两个地区各算一家：适配器已接线（账号 / 目录 / 会话转发 /
+        // 余额 / 网页登录），且有远程目录（`GET /proxy/v1/model_config/models`）
+        // —— 必须在列表里，否则目录刷新循环不会问它。
+        ProviderKind::Tabbit,
+        ProviderKind::TabbitIntl,
         // OrcaTerm：适配器已接线（账号 / 续期 / 转发 / 余额），但**没有**
         // 远程模型目录（静态清单，`supports_model_refresh()` 为 false）——
         // 进本列表只代表「已实现」（与 Zcode 同一口径：刷新循环对它是空操作）。

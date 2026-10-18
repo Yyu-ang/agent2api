@@ -154,6 +154,14 @@ pub fn panel_router(state: ServerState) -> Router {
             "/api/session/login/kuku/complete",
             post(api::session::login_kuku_complete),
         )
+        // Tabbit 网页登录收尾：壳侧在用户于官方登录页完成登录后，从登录窗口
+        // 的 Cookie 存储读 `token`（HttpOnly，页面脚本读不到），把 state +
+        // Cookie 一并 POST 交到这里。**免鉴权**：调用方是壳侧进程（登录窗口），
+        // 不带 API Key；安全性由登录任务的一次性 state 承担（与 kuku 同款）。
+        .route(
+            "/api/session/login/tabbit/complete",
+            post(api::session::login_tabbit_complete),
+        )
         // OrcaTerm 网页登录收尾（**兜底入口**）：正式链路是官方 OAuth —— 壳侧
         // 把 `orcaterm://oauth_callback?session_id=…` 交给
         // `/api/session/login/callback`，由后端 `OAuthExchangeToken` 换令牌
@@ -215,6 +223,27 @@ pub fn panel_router(state: ServerState) -> Router {
         // 昵称、各家健康状态、路由中的账号等部署信息（字段清单见 session.rs），
         // 桌面壳的请求由壳带第一把 Key（gateway::request_builder）不受影响。
         .route("/api/session", get(api::session::get_session))
+        // 仅在 protected 管理面开放，权限确认必须由人显式批准。
+        .route(
+            "/api/teleagent/confirmations",
+            get(api::teleagent_confirmations::list),
+        )
+        .route(
+            "/api/provider-conversations",
+            get(api::provider_conversations::list),
+        )
+        .route(
+            "/api/provider-conversations/reset",
+            post(api::provider_conversations::reset),
+        )
+        .route(
+            "/api/teleagent/confirmations/reply",
+            post(api::teleagent_confirmations::reply),
+        )
+        .route(
+            "/api/teleagent/confirmations/view",
+            get(api::teleagent_confirmations::page),
+        )
         .route(
             "/api/config",
             get(api::config_api::get_config)

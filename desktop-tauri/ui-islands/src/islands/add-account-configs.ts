@@ -792,6 +792,71 @@ const OFFICEACE: ProviderConfig = {
 }
 
 /**
+ * Tabbit（浏览器 AI 助手，国内版 web.tabbit.com / 国际版 web.tabbit.ai，
+ * 2026-10 接入）：两家是**两套独立的账号与 Cookie**（`token` JWT），凭证不通用。
+ *
+ * ── 两条来源（都落在后端 `add_tabbit_account`）──────────────
+ * ① **网页登录**：内嵌窗口打开官方登录页，用户正常登录；壳侧从 WebView2 的
+ *    Cookie 存储里读到 `token` 即判成功，交回网关收尾（`base-info` 验活并补
+ *    user_id）。登录页是官方站点本身，没有回调 URL 可捕获。
+ * ② **粘贴 Cookie**：从浏览器开发者工具 / Cookie 编辑器把 `token` 所在的
+ *    Cookie 串贴进来（整段 Cookie 头、Cookie 编辑器 JSON、`{token, user_id}`
+ *    对象三种形态都认，网关自己归一化）。添加时打一次 `base-info` 探活。
+ *
+ * ── 没有「导入桌面端登录态」────────────────────────────────
+ * Tabbit 没有桌面客户端（它是浏览器），登录态只在浏览器 Cookie 里，
+ * 所以显式 `desktop: false`（不写的话桌面壳里会多出一个选了之后什么都没有的分段）。
+ */
+function tabbitForm(spec: { provider: string; label: string; site: string; siteNote: string }): ProviderConfig {
+  const { provider, label, site, siteNote } = spec
+  return {
+    provider,
+    label,
+    desktop: false,
+    // 网页登录：官方登录页 + 壳侧读 Cookie 交回（与 KukuAI 主站方案同构）。
+    // 系统浏览器模式不给：token 藏在 Cookie 存储里，系统浏览器登录完壳侧读不到。
+    webLogin: {
+      noteHtml: t('在<strong>内嵌窗口</strong>里登录 Tabbit {label}的官方站点（<code>{site}</code>）：登录成功后网关自动从窗口的 Cookie 里取回 <code>token</code> 并加入账号列表。', { label, site }),
+      button: t('打开 Tabbit {label}登录页', { label }),
+      busyText: t('等待 Tabbit {label}登录完成…', { label }),
+    },
+    manualTitle: t('粘贴 Cookie'),
+    manualNoteHtml: t('粘贴 Tabbit {label}的登录 Cookie（<code>{site}</code> 域下的 <code>token</code>，一长串 JWT）：整段 Cookie 头、Cookie 编辑器导出的 JSON、<code>{token, user_id}</code> 对象三种形态都认，直接粘就行，网关会自己归一化。请粘贴 <b>{label}</b>账号的 Cookie —— {siteNote}（最容易拿到的办法：直接用上方的「网页登录」，不需要手工找 token。）', { label, site, siteNote }),
+    fields: [
+      { key: 'cookie', label: 'cookie', rows: 4, placeholder: t('粘贴 token 所在的 Cookie（整段 Cookie 头 / Cookie 编辑器 JSON / {token, user_id} 对象都行）') },
+      { key: 'name', label: t('备注名'), optional: true, placeholder: t('可选，留空则用上游返回的账号名') },
+    ],
+  }
+}
+
+/** TeleAgent provider id（与后端注册表一致，modal 里不再需要特判） */
+export const TELEAGENT_PROVIDER = 'teleagent'
+
+/**
+ * TeleAgent：凭证是 super-agent 的本地 session key
+ *（`SUPER_AGENT_LOCAL_SESSION_KEY`）。
+ *
+ * ── 两条来源 ──────────────────────────────────────────
+ * ① **从本机导入**：自动提取 scheduler 进程环境里的 key（需 TeleAgent
+ *    桌面应用正在运行；Unix 才有这条路，Windows 上提不到时改用②）。
+ * ② **粘贴 Session Key**：把 key 贴进来，添加时先对本机 super-agent
+ *    打一次探活（`GET /provider` 带签名），key 无效或 TeleAgent 没在跑
+ *    会直接报错，不会落下一条死账号。
+ */
+const TELEAGENT: ProviderConfig = {
+  provider: TELEAGENT_PROVIDER,
+  label: 'TeleAgent',
+  desktop: true,
+  desktopNote: t('从本机 TeleAgent 桌面应用自动提取 session key（需 TeleAgent 正在运行；Windows 上若提取不到请改用下方粘贴）。'),
+  manualTitle: t('粘贴 Session Key'),
+  manualNoteHtml: t('粘贴 TeleAgent super-agent 的 <code>SUPER_AGENT_LOCAL_SESSION_KEY</code>。网关用它给上游请求签名；添加时会先打一次上游探活，key 无效或本机 TeleAgent 没在跑会直接报错。'),
+  fields: [
+    { key: 'session_key', label: 'Session Key', rows: 3, placeholder: t('粘贴 SUPER_AGENT_LOCAL_SESSION_KEY') },
+    { key: 'name', label: t('备注名'), optional: true, placeholder: t('可选，留空则自动命名') },
+  ],
+  }
+
+/**
  * OrcaTerm（腾讯云遨驰终端桌面客户端）：一家一个 provider，没有地区之分。
  *
  * ── 凭证形态 ────────────────────────────────────────────────
@@ -924,6 +989,13 @@ export const BUILTIN_CONFIGS: ProviderConfig[] = [
   // OfficeAce（华为云果办 / OfficeClaw）：浏览器登录（自助 OAuth）或粘贴网关
   //凭据，排在末尾（与后端注册表 PROVIDERS 的排列一致，2026-10 接入）
   OFFICEACE,
+  // Tabbit（浏览器 AI 助手）的两个地区相邻（与 MonkeyCode 同一拆法）：
+  // 国内版在前 —— 与后端注册表 PROVIDERS 的追加顺序一致（2026-10 接入）
+  tabbitForm({ provider: 'tabbit', label: t('国内版'), site: 'web.tabbit.com', siteNote: t('国内版与国际版是**两套独立的账号**（同一产品的两个站点），token 不通用。') }),
+  tabbitForm({ provider: 'tabbit-intl', label: t('国际版'), site: 'web.tabbit.ai', siteNote: t('国际版的站点是 web.tabbit.ai，与国内版不是同一站；国内直连国际版会被上游 403 拦截（地区限制），建议配好代理再添加。') }),
+  // TeleAgent：凭证是 super-agent 的本地 session key（手动粘贴 / 从本机导入），
+  // 排在末尾（与后端注册表 PROVIDERS 的排列一致，2026-10 接入）
+  TELEAGENT,
   // OrcaTerm（腾讯云遨驰终端桌面客户端）：粘贴 accessToken / 导入桌面端登录态，
   // 排在末尾（与后端注册表 PROVIDERS 的排列一致，2026-10 接入）
   ORCATERM,

@@ -372,6 +372,17 @@ impl AccountStore {
             // 之类与它无关的空字段，而「刷新 Token」按钮靠的 hasRefreshToken
             // 只是**恰好**在兜底形状里也算得出来 —— 那不是设计，是巧合。
             self.to_officeace_public_account(record)
+        } else if record.provider() == super::tabbit_accounts::TABBIT_PROVIDER_ID
+            || record.provider() == super::tabbit_accounts::TABBIT_INTL_PROVIDER_ID
+        {
+            // Tabbit 两个地区（`tabbit` / `tabbit-intl`）共用这一份公开形态：
+            // 字段两地完全一致（uid / loginName / tokenTail），差别只在站点域名
+            // （那是转发与凭证层的事）
+            self.to_tabbit_public_account(record)
+        } else if record.provider() == super::teleagent_accounts::TELEAGENT_PROVIDER_ID {
+            // TeleAgent：只透出标识与 key 尾号（key 本体不出这个函数）。
+            // 漏这一支会掉进 workbuddy 兜底形状，界面多出一批与它无关的空字段。
+            self.to_teleagent_public_account(record)
         } else if record.provider() == super::orcaterm_accounts::ORCATERM_PROVIDER_ID {
             // OrcaTerm（腾讯云遨驰终端桌面客户端）：单一入口（粘贴 accessToken /
             // 导入桌面端登录态），公开形态带 uid(=userId) / loginName(=昵称) /

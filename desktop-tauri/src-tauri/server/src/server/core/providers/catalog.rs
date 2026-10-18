@@ -186,6 +186,22 @@ pub(crate) fn refresh_meta(kind: ProviderKind) -> (bool, i64) {
             super::officeace::models::remote_refreshed(),
             super::officeace::models::last_refreshed_at(),
         ),
+        // TeleAgent 的清单来自本机 super-agent 的 `GET /provider`
+        //（只收 `source == "config"` 的已配置 provider，见 `teleagent/models.rs`）。
+        ProviderKind::TeleAgent => (
+            super::teleagent::models::remote_refreshed(),
+            super::teleagent::models::last_refreshed_at(),
+        ),
+        // Tabbit 两个地区各有一份独立清单（缓存按地区分格，见
+        // `tabbit::models` 的模块头）：这里如实各查**自己那一格**。
+        ProviderKind::Tabbit | ProviderKind::TabbitIntl => {
+            let region = super::tabbit::Region::from_kind(kind)
+                .unwrap_or(super::tabbit::Region::Cn);
+            (
+                super::tabbit::models::remote_refreshed(region),
+                super::tabbit::models::last_refreshed_at(region),
+            )
+        },
         // OrcaTerm 的清单来自客户端内置（上游没有列模型的接口，见
         // `orcaterm::models` 的模块头）：永远不是远程来源，也没有刷新时刻。
         // 与 ZCode 同一口径：如实回 `(false, 0)`，界面的「来源」列显示成内置清单。

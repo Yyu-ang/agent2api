@@ -1107,6 +1107,82 @@ pub async fn add_account(state: &ServerState, body: &Bytes) -> Response {
             // 面板传来的名字是用户自己打的 ⇒ 标 custom（此后续期/重登不改它）
             store.add_officeace_account(&payload, import_name, true)
         }
+        // TeleAgent：凭证是 super-agent 的本地 session key。
+        // `importDesktop: true` → 从本机 scheduler 进程环境自动提取
+        // （需 TeleAgent 正在运行，Unix 才有这条路）；
+        // 手动粘贴（`session_key`）→ 先对本机 super-agent 探活，key 有效才落盘。
+        // 提取到的登录态也落成账号记录：账号页要展示、用量要记账（见
+        // `teleagent_accounts.rs` 模块头）。
+        Some(crate::server::core::providers::ProviderKind::TeleAgent) => {
+            if import_desktop {
+                store.import_teleagent_desktop_account("manual")
+            } else {
+                let key =
+                    crate::server::core::account_store::teleagent_accounts::pasted_key(&payload);
+                if key.is_empty() {
+                    return management_error(
+                        400,
+                        "请粘贴 TeleAgent 的 Session Key（SUPER_AGENT_LOCAL_SESSION_KEY）",
+                    );
+                }
+                if let Err(error) =
+                    crate::server::core::providers::teleagent::protocol::probe_with_key(&key, 8000)
+                        .await
+                {
+                    return management_error(error.status_code, error.message);
+                }
+                store.add_teleagent_account(&key, import_name, "manual")
+            }
+        }
+        // Tabbit（浏览器 AI 助手，两个地区）：**粘贴 Cookie**（Cookie 头串 /
+        // Cookie 编辑器 JSON / `{token, user_id}` 对象，见
+        // `tabbit::credentials::credentials_from_paste`）→ 用上游 `base-info`
+        // 验证并补身份 → 落账号。地区由 provider id 决定（权威）；粘贴串里若
+        // 带可识别的登录域名，按域名自动归位（解析函数内处理）。
+        // 「网页登录」是另一条链路（`api::session::login_start` 的通用网页登录
+        // → 壳侧读 `token` Cookie → `/api/session/login/tabbit/complete`
+        // → 同一个落账号入口 `add_tabbit_account`）。
+        //
+        // `importDesktop` 不提供：Tabbit 没有桌面客户端（它是浏览器），登录态
+        // 在浏览器 Cookie 里 —— 给了入口只会稳定失败。
+        Some(kind @ (crate::server::core::providers::ProviderKind::Tabbit
+            | crate::server::core::providers::ProviderKind::TabbitIntl)) => {
+            if import_desktop {
+                return management_error(
+                    400,
+                    "Tabbit 没有桌面客户端，请粘贴 Cookie 或使用「网页登录」添加账号",
+                );
+            }
+            let region = crate::server::core::providers::tabbit::Region::from_kind(kind)
+                .unwrap_or(crate::server::core::providers::tabbit::Region::Cn);
+            let raw = payload
+                .get("cookie")
+                .or_else(|| payload.get("token"))
+                .or_else(|| payload.get("cookieText"))
+                .or_else(|| payload.get("text"))
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .trim();
+            let parsed = match crate::server::core::providers::tabbit::credentials::credentials_from_paste(
+                raw, region,
+            ) {
+                Ok(credentials) => credentials,
+                Err(reason) => return management_error(400, reason),
+            };
+            let verified =
+                match crate::server::core::providers::tabbit::credentials::enrich_identity(
+                    &parsed, None,
+                )
+                .await
+                {
+                    Ok(credentials) => credentials,
+                    Err(error) => return management_error(error.status_code, error.message),
+                };
+            // 粘贴串里若带了另一地区的域名，解析函数已按域名归位：
+            // 落账号用凭证实际的地区（与用户点的那一家不一致时，以域名为准，
+            // 参考实现的「按登录域名自动归入正确板块」）
+            store.add_tabbit_account(&verified, import_name, "manual")
+        }
         // OrcaTerm（腾讯云遨驰终端桌面客户端）：**粘贴 accessToken**（OAuth JWT）
         // → 本地归一化（剥 `Bearer ` / `ot_session=` 前缀；整段 data.bin JSON
         // 直接粘也行）→ 打一次 `GetUserInfo` 做**真实校验**（顺带补 userId 与

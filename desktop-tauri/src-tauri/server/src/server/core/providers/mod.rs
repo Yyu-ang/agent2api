@@ -162,6 +162,22 @@ pub mod qoder;
 pub mod raccoon;
 pub mod refresh_flight;
 pub mod router;
+/// 有状态 provider（Tabbit / TeleAgent）共用的跨请求会话设施：显式会话 ID
+/// （含 `x-session-id` 头）、调用方隔离、排队上限、失败即作废的 `Turn`。
+pub mod stateful_session;
+/// TeleAgent（桌面 AI 助手）。适配实现在 `teleagent/`：签名鉴权
+/// （HMAC-SHA256，session key 取自本机 scheduler 进程环境）+ 模型目录
+/// （`GET /provider`）+ **会话转发**（建会话 → prompt_async → SSE 事件流），
+/// `is_stateful()` 为 true。无账号概念：零账号可转发（见 `teleagent/mod.rs`
+/// 的模块头）。
+pub mod teleagent;
+/// Tabbit（浏览器 AI 助手）。适配实现在 `tabbit/`：账号管理（粘贴 Cookie /
+/// 网页登录）**加推理转发**（HMAC 签名 + 建会话 → SSE，`is_stateful()` 为 true）。
+/// 默认每请求独立建会话；流式请求带显式会话 ID 时复用上游会话、只发增量
+/// （见 `tabbit/session.rs` 与 `stateful_session`）。
+/// 国内版（`tabbit`）/ 国际版（`tabbit-intl`，`web.tabbit.ai`，国内直连 403）
+/// 是两家 provider、同一份实现按地区参数化（见 `tabbit::region`）。
+pub mod tabbit;
 /// Trae（字节 AI IDE）。适配实现在 `trae/`：登录 / 凭据 / 目录 / 会话式转发
 /// 已接通（只支持国内 SOLO 通道；国际版是另一套协议，将来另立 kind），见
 /// `trae/mod.rs` 的模块头。
@@ -474,6 +490,37 @@ pub enum ProviderKind {
     /// 不需要 CodeArts 那种会话闸门。凭据两层：网关 Basic（不过期，转发用）
     /// 与控制面临时 AK/SK（2 小时，额度/签到用）。
     OfficeAce,
+    /// TeleAgent（桌面 AI 助手，`teleagent.cn`）。
+    ///
+    /// 上游是本机 `127.0.0.1:4397` 的 super-agent（TeleAgent 桌面应用），
+    /// 协议移植自 `lizhun781021/teleagent-openai-proxy`（MIT）：
+    /// HMAC-SHA256 签名（`local-v1`）+ 建会话 → `prompt_async` → SSE 事件流，
+    /// 模型 id 形如 `NewApi/chat-pro`。**无账号概念**：凭证是本机 scheduler
+    /// 进程环境里的 session key，零账号可转发（见 `teleagent/mod.rs`）。
+    TeleAgent,
+    /// Tabbit **国内版**（`tabbit`）。适配实现在 `tabbit/`：账号管理（粘贴
+    /// Cookie / 网页登录）**加推理转发**（HMAC 签名 + 建会话 → SSE，
+    /// `is_stateful()` 为 true，会话是请求内的）。
+    ///
+    /// ── 上游长什么样（tabbit2api 2026-10 实测，见 `tabbit/mod.rs` 的模块头）──
+    /// 认证是 `token`（HttpOnly JWT）Cookie；签名 key 由 `GET /chat/sign-key`
+    /// 动态获取（各域名独立）；对话 `POST /panel/session` 建会话 →
+    /// `POST /api/v1/chat/completion`（SSE）；`selected_model` 必须传目录里的
+    /// `display_name`；额度 `GET /api/commerce/quota/v1/usage`（上游真实值）。
+    ///
+    /// ── 与 [`ProviderKind::TabbitIntl`] 是同一套协议的两个地区 ────
+    /// 与 AutoClaw / Qoder / ZCode 的两地同一思路：地区是**provider 身份**
+    /// 而不是账号属性。两家共用**一份实现**：`tabbit::adapter::TabbitAdapter`
+    /// 持有一个 `tabbit::region::Region`，两个静态实例（`TABBIT_ADAPTER` /
+    /// `TABBIT_INTL_ADAPTER`）由 `adapter_for` 按 kind 给出。
+    /// 地区 → provider 的互查在 `tabbit::region::Region`（`kind` /
+    /// `provider_id` / `from_kind`），别处不要再写 `"tabbit-intl"` 这类字面量。
+    Tabbit,
+    /// Tabbit **国际版**（`tabbit-intl`，`web.tabbit.ai`）。与
+    /// [`ProviderKind::Tabbit`] 同一套协议、不同站点。**国内网络直连固定
+    /// 403**（地区限制）：账号未显式配代理时跟随系统代理
+    /// （`system_proxy_when_unset`，与 Antigravity 同一口径）。
+    TabbitIntl,
     /// OrcaTerm（腾讯云遨驰终端桌面客户端）。适配实现在 `orcaterm/`：
     /// 账号管理（粘贴 accessToken / 导入桌面端登录态）+ OAuth 续期 +
     /// 会话转发（建会话 → assistant SSE）+ 余额（月度 AI 配额）；
@@ -593,6 +640,13 @@ pub const PROVIDERS: &[ProviderMeta] = &[
     // glm-5.3 / deepseek-v4-flash-0731 / kimi-k2.6 …），注册表顺序决定目录
     // 合并时同名模型先归谁家 —— 放在末尾即「同名时优先已有各家」。
     ProviderMeta { id: "officeace", label: "OfficeAce 果办" },
+    // TeleAgent：排末尾（新家按约定追加在末尾）。模型 id 是 `{providerID}/{modelID}`
+    // 形态（如 `NewApi/chat-pro`），带 `/` 前缀，与别家天然不撞。
+    ProviderMeta { id: "teleagent", label: "TeleAgent" },
+    // Tabbit 两个地区**相邻**排列（与 AutoClaw / Qoder / ZCode 同一理由）：
+    // 国内版在前。排在末尾（新家按约定追加在末尾，后到居后）。
+    ProviderMeta { id: "tabbit", label: "Tabbit 国内版" },
+    ProviderMeta { id: "tabbit-intl", label: "Tabbit 国际版" },
     // OrcaTerm（腾讯云遨驰终端桌面客户端）：单一入口（粘贴 accessToken /
     // 导入桌面端登录态），没有地区伴生。排在末尾（2026-10 接入，后到居后）。
     // 它的模型名（glm-5.3 / kimi-k3 / deepseek-v4-* 等）与 codearts / catpaw /
@@ -687,6 +741,9 @@ pub fn kind_from_id(id: &str) -> Option<ProviderKind> {
         "commandcode" => Some(ProviderKind::CommandCode),
         "antigravity" => Some(ProviderKind::Antigravity),
         "officeace" => Some(ProviderKind::OfficeAce),
+        "teleagent" => Some(ProviderKind::TeleAgent),
+        "tabbit" => Some(ProviderKind::Tabbit),
+        "tabbit-intl" => Some(ProviderKind::TabbitIntl),
         "orcaterm" => Some(ProviderKind::OrcaTerm),
         "chatglm" => Some(ProviderKind::Chatglm),
         // 走到这里 = 上面的注册表判定已放行、这个 match 却没有对应分支：
@@ -730,6 +787,9 @@ pub const fn kind_id(kind: ProviderKind) -> &'static str {
         ProviderKind::CommandCode => "commandcode",
         ProviderKind::Antigravity => "antigravity",
         ProviderKind::OfficeAce => "officeace",
+        ProviderKind::TeleAgent => "teleagent",
+        ProviderKind::Tabbit => "tabbit",
+        ProviderKind::TabbitIntl => "tabbit-intl",
         ProviderKind::OrcaTerm => "orcaterm",
         ProviderKind::Chatglm => "chatglm",
     }

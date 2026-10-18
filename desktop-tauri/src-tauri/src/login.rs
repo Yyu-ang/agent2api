@@ -670,7 +670,7 @@ fn allowed_hosts(provider: &str) -> Option<&'static [&'static str]> {
         // 看不出）。
         "catpaw" | "qoder" | "qoder-intl" | "cline-free" | "cline-pass" | "autoclaw"
         | "autoclaw-intl" | "accio" | "accio-cn" | "zcode" | "zcode-intl" | "codearts" | "trae"
-        | "kuku" | "antigravity" | "officeace" | "orcaterm" => None,
+        | "kuku" | "antigravity" | "officeace" | "tabbit" | "tabbit-intl" | "orcaterm" => None,
         // WorkBuddy 的两个地区共用这一张表（表里 `workbuddy.ai` 那一行就是国际站
         // 的登录域）。**显式列出**而不是靠下面的默认分支：上面那条警告要求
         // 「新 provider 落到默认分支」必须是有意的选择，写出来才看得出是选过的
@@ -892,6 +892,11 @@ fn normalize_provider(provider: &str) -> Result<&'static str, String> {
         // 与轮询 —— 与 ZCode / CodeArts 同一条路。它的授权码由网关**轮询云端**
         // 取回（云端回调页不往本机跳），所以窗口最后停在云端页上也不影响登录判定。
         "officeace" => Ok("officeace"),
+        // Tabbit 两个地区：授权地址由**后端适配器**拼（官方登录页），壳侧负责
+        // 开窗口、读 `token` Cookie 交回网关（见 `submit_tabbit_login`）。
+        // 漏了这一条前端点「网页登录」会直接报「不支持网页登录的提供商」。
+        "tabbit" => Ok("tabbit"),
+        "tabbit-intl" => Ok("tabbit-intl"),
         // OrcaTerm（腾讯云遨驰终端）：地址由**后端适配器**返回（官方 OAuth 授权页，
         // 它会 302 到微信二维码），壳侧负责开窗口并把回调
         // `orcaterm://oauth_callback?session_id=…` 交回网关换令牌
@@ -1655,6 +1660,12 @@ async fn run_embedded(
     // 临时风控限流（同一凭证几分钟后即恢复，2026-10-07 实测对照），
     // 密集重试只会延长风控窗口。
     let mut kuku_retry_block_until: Option<tokio::time::Instant> = None;
+    // Tabbit 登录态只交回一次（判据是 Cookie 存储里出现 `token`，见等待循环
+    // 的 tabbit 分支与 `submit_tabbit_login`）。导航计数与 kuku 共用同一套
+    // 触发节拍（登录必然经过导航），单独记各自的 tick / last_nav。
+    let tabbit_submitted = Arc::new(AtomicBool::new(false));
+    let mut tabbit_check_tick: u32 = 0;
+    let mut tabbit_last_nav: u64 = 0;
 
     // 导航拦截与弹窗拦截**共用同一个标志**：两种入口收到的可能是同一个回调
     // （页面先改 location、再被 WebView2 派生出一条弹窗请求），分开各一个标志
@@ -1742,7 +1753,7 @@ async fn run_embedded(
             }
             // KukuAI 主站登录：每次导航（含跳 passport、登录后回跳主站）
             // 计数 +1，等待循环据此立即读一次 Cookie 存储做登录检测。
-            if provider == "kuku" {
+        if provider == "kuku" || provider == "tabbit" || provider == "tabbit-intl" || provider == "orcaterm" {
                 nav_counter_for_nav.fetch_add(1, Ordering::SeqCst);
             }
             host_allowed(url, provider, social_restore)
@@ -1899,6 +1910,42 @@ async fn run_embedded(
         // `on_new_window` 拦下并交给后端换令牌，成功与否统一走 `/wait`。
         // 初版那套「读窗口 cookie 找 ot_session」已删除：那条 Cookie 在
         // SPA 内扫码登录时根本不会被写出（见模块头的实测对照）。
+        // Tabbit（国内版 web.tabbit.com / 国际版 web.tabbit.ai）：用户在内嵌
+        // 窗口里正常登录，壳侧以 **Cookie 存储里出现 `token`** 作为成功判据
+        // （`token` 是 JWT，上游鉴权凭据；读 cookie 走独立线程 + 超时，见
+        // `read_window_cookies`）。触发节拍与 kuku 同构：导航事件后立即读一次、
+        // 另每 4 拍（8 秒）兜底。`token` 不像 BDUSS 有影子 cookie 问题，发现即交回。
+        if provider == "tabbit" || provider == "tabbit-intl" {
+            tabbit_check_tick += 1;
+            let nav_count = nav_counter_for_check.load(Ordering::SeqCst);
+            let navigated = nav_count != tabbit_last_nav;
+            if navigated {
+                tabbit_last_nav = nav_count;
+            }
+            if !tabbit_submitted.load(Ordering::SeqCst)
+                && (navigated || tabbit_check_tick % 4 == 0)
+            {
+                match read_window_cookies(&window).await {
+                    Ok(cookies) => {
+                        let (header, has_token) = tabbit_cookie_header(&cookies);
+                        if has_token {
+                            tabbit_submitted.store(true, Ordering::SeqCst);
+                            if let Err(error) =
+                                submit_tabbit_login(&header, login_state).await
+                            {
+                                eprintln!(
+                                    "[login] 交回 Tabbit 登录态失败（下轮重试）: {error}"
+                                );
+                                tabbit_submitted.store(false, Ordering::SeqCst);
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        eprintln!("[login] Tabbit 读取窗口 Cookie 失败（下轮重试）: {error}");
+                    }
+                }
+            }
+        }
         match poll_once(login_state).await {
             PollOutcome::Pending => continue,
             // 任务载荷（`{account, warning…}`）随成功结果透传：前端据此
@@ -2046,6 +2093,17 @@ async fn submit_kuku_login(
     Ok(())
 }
 
+/// Tabbit 登录态交回：用户在内嵌窗口（web.tabbit.com / web.tabbit.ai）里登录
+/// 成功后，读 WebView2 的 Cookie 存储（含 HttpOnly），把 `token` 所在的
+/// Cookie 头 POST 网关收尾（`/api/session/login/tabbit/complete`，见
+/// `providers/tabbit/login.rs`）。`token` 是 JWT，上游一切鉴权都认它。
+async fn submit_tabbit_login(cookie_header: &str, login_state: &str) -> Result<(), String> {
+    let payload = json!({ "state": login_state, "cookie": cookie_header });
+    gateway::call("POST", "/api/session/login/tabbit/complete", Some(&payload))
+        .await
+        .map_err(|error| format!("网关收尾失败: {error}"))?;
+    Ok(())
+}
 
 /// 用系统默认浏览器打开链接。
 ///

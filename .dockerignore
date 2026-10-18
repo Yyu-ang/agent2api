@@ -17,6 +17,9 @@ target
 node_modules
 *.md
 .env
+.env.*
+# OpenCode2API 可选 sidecar 的密钥（只给 sidecar 的一次性种子容器用）
+integrations
 
 # 桌面壳的 Rust 工程不进镜像（tauri 全家桶），但网关 crate（server/）
 # 与 workspace 清单（Cargo.toml / Cargo.lock）必须进
