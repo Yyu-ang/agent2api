@@ -152,6 +152,9 @@ pub mod qoder;
 pub mod raccoon;
 pub mod refresh_flight;
 pub mod router;
+/// 有状态 provider（Tabbit / TeleAgent）共用的跨请求会话设施：显式会话 ID
+/// （含 `x-session-id` 头）、调用方隔离、排队上限、失败即作废的 `Turn`。
+pub mod stateful_session;
 /// TeleAgent（桌面 AI 助手）。适配实现在 `teleagent/`：签名鉴权
 /// （HMAC-SHA256，session key 取自本机 scheduler 进程环境）+ 模型目录
 /// （`GET /provider`）+ **会话转发**（建会话 → prompt_async → SSE 事件流），
@@ -159,8 +162,9 @@ pub mod router;
 /// 的模块头）。
 pub mod teleagent;
 /// Tabbit（浏览器 AI 助手）。适配实现在 `tabbit/`：账号管理（粘贴 Cookie /
-/// 网页登录）**加推理转发**（HMAC 签名 + 建会话 → SSE，`is_stateful()` 为 true，
-/// 会话是**请求内**的、不跨请求保持状态，与 KukuAI 同形态）。
+/// 网页登录）**加推理转发**（HMAC 签名 + 建会话 → SSE，`is_stateful()` 为 true）。
+/// 默认每请求独立建会话；流式请求带显式会话 ID 时复用上游会话、只发增量
+/// （见 `tabbit/session.rs` 与 `stateful_session`）。
 /// 国内版（`tabbit`）/ 国际版（`tabbit-intl`，`web.tabbit.ai`，国内直连 403）
 /// 是两家 provider、同一份实现按地区参数化（见 `tabbit::region`）。
 pub mod tabbit;

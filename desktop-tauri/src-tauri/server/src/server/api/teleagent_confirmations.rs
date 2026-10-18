@@ -1,6 +1,15 @@
 //! TeleAgent 人工确认管理 API（protected router，与账号配置相同鉴权边界）。
+//!
+//! ── 额外的同源校验 ─────────────────────────────────────────
+//! 「没配 API Key、也没开面板认证」时 protected 组全部放行，而面板响应带
+//! `Access-Control-Allow-Origin: *`：用户浏览器里任意网页都能读待确认列表、
+//! 替用户批准本机 agent 执行命令。这里的后果比普通配置接口严重，所以列表与
+//! 回复两个接口一律拒绝跨源浏览器请求（`Origin` 与 `Host` 不一致，或
+//! `Sec-Fetch-Site: cross-site`）。确认页本身同源加载，不受影响；脚本 / curl
+//! 不带 `Origin`，照常按原有鉴权放行。
 use axum::body::Bytes;
 use axum::extract::State;
+use axum::http::HeaderMap;
 use axum::response::{Html, Response};
 use serde_json::Value;
 
@@ -9,15 +18,40 @@ use crate::server::errors;
 use crate::server::http::{ok_json, parse_body};
 use crate::server::ServerState;
 
+/// 浏览器跨源请求（含 `Origin: null`）→ true。
+pub(crate) fn is_cross_origin(headers: &HeaderMap) -> bool {
+    let header = |name: &str| headers.get(name).and_then(|value| value.to_str().ok()).unwrap_or("");
+    if header("sec-fetch-site").eq_ignore_ascii_case("cross-site") {
+        return true;
+    }
+    let origin = header("origin").trim();
+    if origin.is_empty() {
+        return false;
+    }
+    let host = header("host").trim();
+    let origin_host = origin.split_once("://").map(|(_, rest)| rest).unwrap_or("");
+    host.is_empty() || origin_host.is_empty() || !origin_host.eq_ignore_ascii_case(host)
+}
+
+fn reject_cross_origin() -> Response {
+    errors::management_error(403, "确认接口只接受同源请求（请在网关自身的确认页或脚本里操作）")
+}
+
 /// GET /api/teleagent/confirmations
-pub async fn list(State(_state): State<ServerState>) -> Response {
+pub async fn list(State(_state): State<ServerState>, headers: HeaderMap) -> Response {
+    if is_cross_origin(&headers) {
+        return reject_cross_origin();
+    }
     ok_json(confirmations::list())
 }
 
 /// POST /api/teleagent/confirmations/reply
 /// {"session_id":"...", "id":"...", "reply":"once|always|reject"}
 /// 或 {"session_id":"...", "id":"...", "answers":["..."]}
-pub async fn reply(State(_state): State<ServerState>, body: Bytes) -> Response {
+pub async fn reply(State(_state): State<ServerState>, headers: HeaderMap, body: Bytes) -> Response {
+    if is_cross_origin(&headers) {
+        return reject_cross_origin();
+    }
     let payload = match parse_body(&body) {
         Ok(value) => value,
         Err(error) => return errors::management_error(400, error.message),
@@ -106,3 +140,28 @@ async function refresh(){
 document.getElementById('refresh').onclick=refresh;
 refresh();
 </script></body></html>"#;
+
+#[cfg(test)]
+mod parity_tests {
+    use super::is_cross_origin;
+    use axum::http::HeaderMap;
+
+    fn headers(pairs: &[(&'static str, &str)]) -> HeaderMap {
+        let mut map = HeaderMap::new();
+        for (name, value) in pairs {
+            if let Ok(value) = value.parse() {
+                map.insert(*name, value);
+            }
+        }
+        map
+    }
+
+    #[test]
+    fn confirmation_endpoints_reject_cross_origin_browsers() {
+        assert!(!is_cross_origin(&headers(&[("host", "127.0.0.1:3000")])), "脚本/curl 不带 Origin");
+        assert!(!is_cross_origin(&headers(&[("host", "127.0.0.1:3000"), ("origin", "http://127.0.0.1:3000")])));
+        assert!(is_cross_origin(&headers(&[("host", "127.0.0.1:3000"), ("origin", "https://evil.example")])));
+        assert!(is_cross_origin(&headers(&[("host", "127.0.0.1:3000"), ("origin", "null")])));
+        assert!(is_cross_origin(&headers(&[("host", "127.0.0.1:3000"), ("sec-fetch-site", "cross-site")])));
+    }
+}

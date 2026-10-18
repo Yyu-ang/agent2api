@@ -9,14 +9,16 @@
 //!
 //! ── 多轮与模型 ──────────────────────────────────────────────
 //! 上游 `content` 是单条文本：OpenAI messages 拍平成一条 prompt。
-//! 带明确 conversation_id 的请求采用会话复用 + 指纹增量，历史变化时安全重建；
-//! 未提供会话 ID 则独立建会话并以 16k 字符预算裁剪输入，避免跨客户端串上下文。
+//! 带明确会话 ID 的**流式**请求采用会话复用 + 指纹增量，历史变化 / 完全重复时
+//! 安全重建；增量发送失败自动作废会话并以新会话 + 全量重试一次。未提供会话 ID
+//! 或非流式请求独立建会话并以 16k 字符预算裁剪输入，避免跨客户端串上下文。
 //! 模型参数 `selected_model` 必须传目录里的 `display_name`
 //! （`models::resolve_model` 归一）。
 //!
 //! ── 会话安全边界 ─────────────────────────────────────────
-//! 会话注册表在 `session.rs`：地区、账号、凭证、模型与显式会话 ID 全部隔离；
-//! tokio owned guard 跨越整个 SSE 生命周期，失败撤销增量指纹。
+//! 会话注册表在 `session.rs`：地区、账号、凭证、模型、网关调用方与显式会话 ID
+//! 全部隔离；`Turn`（owned guard）跨越整个 SSE 生命周期，未成功 commit 即作废；
+//! 同会话排队最多 30 秒，超时 409。
 //!
 //! ── 错误口径 ──────────────────────────────────────────────
 //!   - 401/403 → 登录态失效（上游无刷新接口）：`GatewayError` 401，由
@@ -32,6 +34,7 @@
 
 use std::sync::Arc;
 
+use axum::http::HeaderMap;
 use bytes::Bytes;
 use futures::StreamExt;
 use serde_json::{Map, Value, json};
@@ -43,7 +46,10 @@ use crate::server::core::upstream::usage::RequestTelemetry;
 use crate::server::core::upstream::ForwardOutcome;
 use crate::server::errors::GatewayError;
 
+use crate::server::core::providers::stateful_session::{self, sleep_or_cancel};
+
 use super::credentials::{self, TabbitCredentials};
+use super::session::Turn;
 use super::protocol;
 use super::region::Region;
 
@@ -57,11 +63,13 @@ const BUSY_WAIT_MS: u64 = 2_000;
 const BUSY_RETRY_MAX: usize = 2;
 
 /// 转发入口（有状态路径 `forward_conversation` 转调）。
+#[allow(clippy::too_many_arguments)]
 pub async fn run_chat(
     region: Region,
     store: &AccountStore,
     account_id: &str,
     body: &Value,
+    headers: &HeaderMap,
     proxy: Option<ResolvedProxy>,
     stream: bool,
     telemetry: &Arc<RequestTelemetry>,
@@ -74,100 +82,182 @@ pub async fn run_chat(
         .to_string();
     let model = super::models::resolve_model(region, &client_model)?;
     let fingerprints = super::session::fingerprints(body.get("messages"));
-    // 只有显式 conversation_id 才启用复用；没有身份的兼容调用维持请求隔离。
-    let mut conversation = match super::session::entry(region, account_id, &credentials.token, &model, body) {
-        Some(state) => Some(state.lock_owned().await),
-        None => None,
-    };
-    if body.get("reset_session").and_then(Value::as_bool) == Some(true) {
-        if let Some(item) = conversation.as_mut() { item.reset(); }
-    }
-    let previous = conversation.as_ref().and_then(|item| {
-        let id = item.session_id.as_ref()?;
-        let index = super::session::delta_start(&item.sent, &fingerprints)?;
-        Some((id.clone(), index))
-    });
-    let messages = body.get("messages");
-    let (session_id, prompt) = if let Some((id, start)) = previous {
-        let delta = messages.and_then(Value::as_array)
-            .map(|items| super::session::delta_messages(items, start))
-            .unwrap_or_default();
-        let prompt = build_prompt(Some(&Value::Array(delta)));
-        (id, prompt)
+    // 只有「流式 + 显式会话 ID」才复用；非流式辅助请求（标题、摘要等）不读写
+    // 会话映射（CatPaw 同口径），没有身份的兼容调用维持请求隔离。
+    let slot = if stream {
+        super::session::entry(region, account_id, &credentials.token, &model, body, headers)
     } else {
-        // 会话失效或历史被编辑：新建上游会话并安全回退全量（带 16k 预算）。
-        if let Some(item) = conversation.as_mut() { item.reset(); }
-        let session = create_session(region, &credentials, proxy.as_ref()).await?;
-        (session, build_prompt(messages))
+        None
     };
-    let proxy_ref = proxy.as_ref();
-
-    // ── 对话（SSE；499 自动刷新签名 key 重试一次）─────────────
+    // 排队有上限（超时 409）且可取消；`Turn` 未 commit 就 drop 时自动 reset，
+    // 下面任何 `?` 都不会把失效的上游会话留给下一轮。
+    let mut turn = Turn::acquire(slot, telemetry, "Tabbit").await?;
+    if body.get("reset_session").and_then(Value::as_bool) == Some(true) {
+        turn.reset();
+    }
+    let messages = body.get("messages");
     let url = format!("{}/api/v1/chat/completion", region.base_url());
-    let raw_body = protocol::chat_body(&session_id, &prompt, &model);
-    let response = send_chat_with_retry(region, &credentials, &session_id, &raw_body, &url, proxy_ref)
-        .await?;
+    let opened = open_turn(
+        region, &credentials, &mut turn, &fingerprints, messages, &model, &url, proxy.as_ref(),
+    )
+    .await?;
+    let OpenedTurn { session_id, prompt, response, incremental } = opened;
 
     if let Some(capture) = telemetry.capture().as_deref() {
+        let raw_body = protocol::chat_body(&session_id, &prompt, &model);
         let headers = protocol::chat_headers(region, &credentials, &session_id, &raw_body, "");
         capture.reset_request(&url, super::tabbit_id(region), &headers, body);
         capture.attach_response(response.status().as_u16(), response.headers());
     }
 
     if !stream {
-        let outcome = aggregate(response, &client_model, &prompt).await;
-        if let Some(item) = conversation.as_mut() {
-            if outcome.is_ok() { item.commit(session_id, fingerprints); }
-            else { item.reset(); }
-        }
+        // 非流式不持有会话（见上），`turn` 是空持有。
+        let outcome = aggregate(response, &client_model, &prompt, telemetry).await;
+        drop(turn);
         return outcome;
     }
 
     // 流式：后台任务喂 mpsc，主路径返回 ReceiverStream（与 KukuAI 同结构）
     let (sender, receiver) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(64);
     let requested = client_model;
-    let prompt_chars = prompt.chars().count();
+    let telemetry = Arc::clone(telemetry);
+    let messages = messages.cloned();
     crate::spawn_task(async move {
-        // OwnedMutexGuard 持有到完整 SSE 完成，避免同一上游会话并发发送。
-        let mut conversation = conversation;
+        // `turn` 持有到完整 SSE 完成，避免同一上游会话并发发送。
+        let mut turn = turn;
         let mut response = response;
-        let session_id = session_id;
-        for attempt in 0..=BUSY_RETRY_MAX {
-            match drive_stream(response, &requested, prompt_chars, &sender).await {
+        let mut session_id = session_id;
+        let mut prompt = prompt;
+        let mut incremental = incremental;
+        let mut busy_attempts = 0usize;
+        loop {
+            let mut produced = false;
+            let outcome = drive_stream(
+                response, &requested, &prompt, &sender, &telemetry, &mut produced,
+            )
+            .await;
+            let error = match outcome {
                 Ok(()) => {
-                    if let Some(state) = conversation.as_mut() {
-                        state.commit(session_id.clone(), fingerprints.clone());
+                    turn.commit(session_id, fingerprints);
+                    break;
+                }
+                Err(error) => error,
+            };
+            if is_busy_retry(&error) && busy_attempts < BUSY_RETRY_MAX {
+                busy_attempts += 1;
+                // 复用同一会话，延时后重新发送；不能重建会话却只发增量历史。
+                if let Err(cancelled) = sleep_or_cancel(&telemetry, BUSY_WAIT_MS).await {
+                    let _ = sender.send(Err(std::io::Error::other(cancelled.message))).await;
+                    break;
+                }
+                let payload = protocol::chat_body(&session_id, &prompt, &model);
+                match send_chat_with_retry(region, &credentials, &session_id, &payload, &url, proxy.as_ref()).await {
+                    Ok(next) => {
+                        response = next;
+                        continue;
                     }
-                    break;
-                }
-                Err(error) if is_busy_retry(&error) && attempt < BUSY_RETRY_MAX => {
-                    // 复用同一会话，延时后重新发送；不能重建会话却只发增量历史。
-                    tokio::time::sleep(std::time::Duration::from_millis(BUSY_WAIT_MS)).await;
-                    let payload = protocol::chat_body(&session_id, &prompt, &model);
-                    response = match send_chat_with_retry(
-                        region, &credentials, &session_id, &payload, &url, proxy.as_ref(),
-                    ).await {
-                        Ok(next) => next,
-                        Err(error) => {
-                            if let Some(state) = conversation.as_mut() { state.reset(); }
-                            let _ = sender.send(Err(std::io::Error::other(error.message))).await;
-                            break;
-                        }
-                    };
-                }
-                Err(error) => {
-                    if let Some(state) = conversation.as_mut() { state.reset(); }
-                    crate::server::logging::verbose("[Tabbit]", &format!("对话流处理中断：{}", error.message));
-                    let _ = sender.send(Err(std::io::Error::other(error.message))).await;
-                    break;
+                    Err(error) => {
+                        let _ = sender.send(Err(std::io::Error::other(error.message))).await;
+                        break;
+                    }
                 }
             }
+            // 增量发到复用会话上失败且尚未下发任何内容：上游会话多半已失效，
+            // 作废后用新会话 + 全量历史重试一次（B1）。
+            if incremental && !produced && error.status_code != 499 && !telemetry.is_cancelled() {
+                incremental = false;
+                turn.reset();
+                crate::server::logging::verbose(
+                    "[Tabbit]",
+                    &format!("复用会话上的增量请求失败（{}），改用新会话 + 全量历史重试", error.message),
+                );
+                match open_fresh(region, &credentials, messages.as_ref(), &model, &url, proxy.as_ref()).await {
+                    Ok((id, text, next)) => {
+                        session_id = id;
+                        prompt = text;
+                        response = next;
+                        continue;
+                    }
+                    Err(retry_error) => {
+                        let _ = sender.send(Err(std::io::Error::other(retry_error.message))).await;
+                        break;
+                    }
+                }
+            }
+            crate::server::logging::verbose("[Tabbit]", &format!("对话流处理中断：{}", error.message));
+            let _ = sender.send(Err(std::io::Error::other(error.message))).await;
+            break;
         }
+        // 未 commit 的 `turn` 在这里 drop → 会话作废。
     });
     Ok(ForwardOutcome::Stream {
         status: 200,
         stream: Box::new(ReceiverStream::new(receiver)),
     })
+}
+
+/// 一轮已发出的对话请求。
+struct OpenedTurn {
+    session_id: String,
+    prompt: String,
+    response: reqwest::Response,
+    /// 是否走了「复用会话 + 增量」
+    incremental: bool,
+}
+
+/// 能复用就发增量；增量发送失败（会话失效、上游拒绝等）时作废会话，
+/// 改用新会话 + 全量历史重试一次。凭证失效（401/403）不重试，交给换号。
+#[allow(clippy::too_many_arguments)]
+async fn open_turn(
+    region: Region,
+    credentials: &TabbitCredentials,
+    turn: &mut Turn,
+    fingerprints: &[String],
+    messages: Option<&Value>,
+    model: &str,
+    url: &str,
+    proxy: Option<&ResolvedProxy>,
+) -> Result<OpenedTurn, GatewayError> {
+    if let Some((id, start)) = turn.reusable(fingerprints) {
+        let delta = messages
+            .and_then(Value::as_array)
+            .and_then(|items| super::session::delta_messages(items, start));
+        if let Some(delta) = delta {
+            let prompt = build_prompt(Some(&Value::Array(delta)));
+            let raw_body = protocol::chat_body(&id, &prompt, model);
+            match send_chat_with_retry(region, credentials, &id, &raw_body, url, proxy).await {
+                Ok(response) => {
+                    return Ok(OpenedTurn { session_id: id, prompt, response, incremental: true });
+                }
+                Err(error) if matches!(error.status_code, 401 | 403) => return Err(error),
+                Err(error) => crate::server::logging::verbose(
+                    "[Tabbit]",
+                    &format!("复用会话发送失败（{}），改用新会话 + 全量历史重试", error.message),
+                ),
+            }
+        }
+    }
+    // 会话失效、历史被编辑或首次：新建上游会话并回退全量（带 16k 预算）。
+    turn.reset();
+    let (session_id, prompt, response) =
+        open_fresh(region, credentials, messages, model, url, proxy).await?;
+    Ok(OpenedTurn { session_id, prompt, response, incremental: false })
+}
+
+/// 新建上游会话并发送全量历史。
+async fn open_fresh(
+    region: Region,
+    credentials: &TabbitCredentials,
+    messages: Option<&Value>,
+    model: &str,
+    url: &str,
+    proxy: Option<&ResolvedProxy>,
+) -> Result<(String, String, reqwest::Response), GatewayError> {
+    let session_id = create_session(region, credentials, proxy).await?;
+    let prompt = build_prompt(messages);
+    let raw_body = protocol::chat_body(&session_id, &prompt, model);
+    let response = send_chat_with_retry(region, credentials, &session_id, &raw_body, url, proxy).await?;
+    Ok((session_id, prompt, response))
 }
 
 /// 建会话（`POST /panel/session`，空 body，不带签名头）→ `chat_session_id`。
@@ -324,6 +414,8 @@ enum TabbitEvent {
     Reasoning(String),
     Done,
     Error { message: String, code: Option<i64> },
+    /// 上游 `usage` 事件（形态未固定，交给 `extract_usage` 兼容别名）
+    Usage(Value),
 }
 
 /// 按 `\n\n` 分帧、逐帧取 `event:` / `data:` 的解析器。
@@ -383,6 +475,10 @@ fn event_from_parts(name: &str, data: &Value) -> Vec<TabbitEvent> {
             events
         }
         "finish" | "close" | "cancel" => vec![TabbitEvent::Done],
+        "usage" => {
+            let usage = data.get("usage").unwrap_or(data);
+            if usage.is_object() { vec![TabbitEvent::Usage(usage.clone())] } else { Vec::new() }
+        }
         "error" => {
             let message = data
                 .get("message")
@@ -393,7 +489,7 @@ fn event_from_parts(name: &str, data: &Value) -> Vec<TabbitEvent> {
             vec![TabbitEvent::Error { message, code }]
         }
         // ready / title / message_start / message_finish / thinking /
-        // thinking_finished / switch_model / usage / ttft：元信息，不产出内容
+        // thinking_finished / switch_model / ttft：元信息，不产出内容
         _ => Vec::new(),
     }
 }
@@ -424,13 +520,18 @@ struct TabbitStream {
     scanner: SseScanner,
     saw_end: bool,
     content: String,
+    reasoning: String,
     req_chars: usize,
+    /// 估算的输入 token（上游没给 usage 时的兜底）
+    prompt_tokens: i64,
+    /// 上游 `usage` 事件给出的真实用量（有就优先）
+    upstream_usage: Option<Value>,
     /// 是否已产出过内容帧（409 重试只在未产出时安全，见 `run_chat_with_busy_retry`）
     produced: bool,
 }
 
 impl TabbitStream {
-    fn new(model: &str, req_chars: usize) -> Self {
+    fn new(model: &str, prompt: &str) -> Self {
         Self {
             id: format!(
                 "chatcmpl-{}",
@@ -441,9 +542,24 @@ impl TabbitStream {
             scanner: SseScanner::default(),
             saw_end: false,
             content: String::new(),
-            req_chars,
+            reasoning: String::new(),
+            req_chars: prompt.chars().count(),
+            prompt_tokens: stateful_session::estimate_tokens(prompt),
+            upstream_usage: None,
             produced: false,
         }
+    }
+
+    /// 本轮 usage：上游给了就用上游的，否则按字符粗估（带 `estimated`）。
+    fn usage(&self) -> Value {
+        if let Some(usage) = &self.upstream_usage {
+            if crate::server::core::upstream::usage::extract_usage(usage).is_some_and(|t| t.total > 0) {
+                return usage.clone();
+            }
+        }
+        let completion = stateful_session::estimate_tokens(&self.content)
+            + stateful_session::estimate_tokens(&self.reasoning);
+        stateful_session::usage_json(self.prompt_tokens, completion, 0, true)
     }
 
     /// 喂一段字节，返回该段触发的帧；上游错误事件 → Err（调用方按分类处理）。
@@ -461,11 +577,17 @@ impl TabbitStream {
                 }
                 TabbitEvent::Reasoning(reasoning) => {
                     self.produced = true;
+                    self.reasoning.push_str(&reasoning);
                     frames.push(self.chunk(None, Some(reasoning), None));
                 }
+                TabbitEvent::Usage(usage) => self.upstream_usage = Some(usage),
                 TabbitEvent::Done => {
                     self.saw_end = true;
-                    frames.push(self.chunk(None, None, Some("stop")));
+                    let mut last = self.chunk(None, None, Some("stop"));
+                    if let Frame::Chunk(Value::Object(object)) = &mut last {
+                        object.insert("usage".to_string(), self.usage());
+                    }
+                    frames.push(last);
                     frames.push(Frame::Done);
                 }
                 TabbitEvent::Error { message, code } => {
@@ -489,15 +611,6 @@ impl TabbitStream {
             }
         }
         Ok(frames)
-    }
-
-    /// 流结束（EOF）：上游没给过结束帧时补 `[DONE]`。
-    fn finish(&mut self) -> Vec<Frame> {
-        if self.saw_end {
-            return Vec::new();
-        }
-        self.saw_end = true;
-        vec![Frame::Done]
     }
 
     fn chunk(
@@ -540,10 +653,12 @@ impl TabbitStream {
 async fn drive_stream(
     response: reqwest::Response,
     model: &str,
-    req_chars: usize,
+    prompt: &str,
     sender: &tokio::sync::mpsc::Sender<Result<Bytes, std::io::Error>>,
+    telemetry: &Arc<RequestTelemetry>,
+    produced: &mut bool,
 ) -> Result<(), GatewayError> {
-    let mut converter = TabbitStream::new(model, req_chars);
+    let mut converter = TabbitStream::new(model, prompt);
     let mut byte_stream = response.bytes_stream();
     // 会话忙重试（409）：未产出内容时等待后由调用方重建会话重试 ——
     // 这里只处理流内 error；建会话后的首次 409 由外层 run_chat 循环处理
@@ -551,7 +666,9 @@ async fn drive_stream(
         let bytes = item.map_err(|error| {
             GatewayError::with_status(502, format!("Tabbit 上游流读取失败：{error}"))
         })?;
-        let frames = converter.feed(&bytes)?;
+        let fed = converter.feed(&bytes);
+        *produced = converter.produced;
+        let frames = fed?;
         for frame in frames {
             let wire = frame.wire();
             if sender.send(Ok(Bytes::from(wire))).await.is_err() {
@@ -562,6 +679,7 @@ async fn drive_stream(
     if !converter.saw_end {
         return Err(GatewayError::with_status(502, "Tabbit 上游流提前结束，未收到 finish/close/cancel"));
     }
+    telemetry.report_usage(&converter.usage());
     Ok(())
 }
 
@@ -570,10 +688,10 @@ async fn aggregate(
     response: reqwest::Response,
     model: &str,
     prompt: &str,
+    telemetry: &Arc<RequestTelemetry>,
 ) -> Result<ForwardOutcome, GatewayError> {
-    let mut converter = TabbitStream::new(model, prompt.chars().count());
+    let mut converter = TabbitStream::new(model, prompt);
     let mut byte_stream = response.bytes_stream();
-    let mut reasoning = String::new();
     while let Some(item) = byte_stream.next().await {
         let bytes = item.map_err(|error| {
             GatewayError::with_status(502, format!("Tabbit 上游流读取失败：{error}"))
@@ -586,9 +704,10 @@ async fn aggregate(
                     converter.produced = true;
                 }
                 TabbitEvent::Reasoning(text) => {
-                    reasoning.push_str(&text);
+                    converter.reasoning.push_str(&text);
                     converter.produced = true;
                 }
+                TabbitEvent::Usage(usage) => converter.upstream_usage = Some(usage),
                 TabbitEvent::Done => converter.saw_end = true,
                 TabbitEvent::Error { message, code } => {
                     if protocol::is_busy_error(&message) && !converter.produced {
@@ -610,8 +729,8 @@ async fn aggregate(
     let mut message = Map::new();
     message.insert("role".to_string(), json!("assistant"));
     message.insert("content".to_string(), json!(converter.content));
-    if !reasoning.is_empty() {
-        message.insert("reasoning_content".to_string(), json!(reasoning));
+    if !converter.reasoning.is_empty() {
+        message.insert("reasoning_content".to_string(), json!(converter.reasoning));
     }
     let mut choice = Map::new();
     choice.insert("index".to_string(), json!(0));
@@ -624,23 +743,10 @@ async fn aggregate(
     body.insert("model".to_string(), json!(model));
     body.insert("choices".to_string(), Value::Array(vec![Value::Object(choice)]));
     body.insert("system_fingerprint".to_string(), json!("tabbit"));
-    // 上游 SSE 未可靠提供 token usage；以 CJK=1、其它字符每 4 字约 1 token 粗估。
-    let estimate = |text: &str| -> usize {
-        let mut latin = 0usize;
-        let mut cjk = 0usize;
-        for c in text.chars() {
-            if ('\u{4e00}'..='\u{9fff}').contains(&c) { cjk += 1; }
-            else { latin += 1; }
-        }
-        cjk + latin.div_ceil(4)
-    };
-    let prompt_tokens = estimate(prompt);
-    let completion_tokens = estimate(&converter.content);
-    body.insert("usage".to_string(), json!({
-        "prompt_tokens": prompt_tokens,
-        "completion_tokens": completion_tokens,
-        "total_tokens": prompt_tokens + completion_tokens,
-    }));
+    // 上游 `usage` 事件可用时直接用；否则按 CJK=1、其它字符每 4 字约 1 token 粗估。
+    let usage = converter.usage();
+    telemetry.report_usage(&usage);
+    body.insert("usage".to_string(), usage);
     Ok(ForwardOutcome::Completion { body: Value::Object(body) })
 }
 
@@ -661,18 +767,20 @@ fn is_busy_retry(error: &GatewayError) -> bool {
 /// 只在**未产出任何内容**时重试（`busy_retry_error` 标记）；已产出内容后
 /// 中断则如实报错（避免半截回答被吞掉后重发）。参考 `_is_busy_error` +
 /// `BUSY_RETRY`。
+#[allow(clippy::too_many_arguments)]
 pub async fn run_chat_with_busy_retry(
     region: Region,
     store: &AccountStore,
     account_id: &str,
     body: &Value,
+    headers: &HeaderMap,
     proxy: Option<ResolvedProxy>,
     stream: bool,
     telemetry: &Arc<RequestTelemetry>,
 ) -> Result<ForwardOutcome, GatewayError> {
     let mut last_error: Option<GatewayError> = None;
     for _attempt in 0..=BUSY_RETRY_MAX {
-        match run_chat(region, store, account_id, body, proxy.clone(), stream, telemetry).await {
+        match run_chat(region, store, account_id, body, headers, proxy.clone(), stream, telemetry).await {
             Ok(outcome) => return Ok(outcome),
             Err(error) => {
                 if is_busy_retry(&error) {
@@ -681,7 +789,8 @@ pub async fn run_chat_with_busy_retry(
                         "[Tabbit]",
                         &format!("会话处理中（409），{BUSY_WAIT_MS}ms 后重试：{detail}"),
                     );
-                    tokio::time::sleep(std::time::Duration::from_millis(BUSY_WAIT_MS)).await;
+                    // 手动终止时立即返回，不再等满 2 秒。
+                    sleep_or_cancel(telemetry, BUSY_WAIT_MS).await?;
                     last_error = Some(GatewayError::with_status(409, detail.to_string()));
                     continue;
                 }

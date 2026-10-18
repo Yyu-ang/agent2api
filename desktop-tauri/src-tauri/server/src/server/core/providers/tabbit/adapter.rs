@@ -6,10 +6,11 @@
 //! 本文件就是那个「接线」：把转发编排给的散装入参转调过去。装配以外的逻辑
 //! 一行都不在这里。
 //!
-//! ── 与 KukuAI 同属「有状态」但会话是**请求内**的 ─────────────
+//! ── 与 KukuAI 同属「有状态」────────────────────────────────
 //! `is_stateful()` 返回 true：上游一次对话 = 建会话 → 签名 POST → SSE，
 //! 塞不进单请求契约（`build_chat_request` 返回 503 防御，理由与 KukuAI 相同）。
-//! 会话**不跨请求**（每次新建、用毕即弃），因此没有会话注册表。
+//! 默认每次新建会话；流式请求带显式会话 ID 时复用（注册表见 `session.rs`），
+//! 会话 ID 可来自 body 或 `x-session-id` 头（`client_headers` 转交给 `chat.rs`）。
 //!
 //! ── 两个地区是两个实例 ──────────────────────────────────────
 //! `TabbitAdapter` 持有一个 `region::Region`，两个静态实例
@@ -57,7 +58,7 @@ use crate::server::core::providers::{kind_id, ProviderKind};
 
 use super::region::Region;
 
-/// Tabbit 适配器（无状态单例：会话是请求内的，凭证在账号存储里，
+/// Tabbit 适配器（无字段单例：会话注册表在 `session.rs`，凭证在账号存储里，
 /// 本结构只持有一个地区标记）。
 pub struct TabbitAdapter {
     region: Region,
@@ -243,7 +244,7 @@ impl ProviderAdapter for TabbitAdapter {
         store: &'a AccountStore,
         account_id: &'a str,
         body: &'a Value,
-        _client_headers: &'a HeaderMap,
+        client_headers: &'a HeaderMap,
         proxy: Option<ResolvedProxy>,
         stream: bool,
         telemetry: &'a Arc<RequestTelemetry>,
@@ -256,7 +257,9 @@ impl ProviderAdapter for TabbitAdapter {
     > {
         let region = self.region;
         Box::pin(async move {
-            chat::run_chat_with_busy_retry(region, store, account_id, body, proxy, stream, telemetry)
+            chat::run_chat_with_busy_retry(
+                region, store, account_id, body, client_headers, proxy, stream, telemetry,
+            )
                 .await
         })
     }

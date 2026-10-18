@@ -12,21 +12,23 @@
 //! 按会话过滤，早开只会多看到别人的事件（被过滤掉），不会丢自己的。
 //!
 //! ── 多轮与模型 ──────────────────────────────────────────────
-//! super-agent 的会话自行维护上下文；明确 conversation_id 时按账号、密钥、
-//! 模型、工作目录和工具定义隔离，发送历史新增部分。无会话 ID 时每请求独立，
-//! 历史改写也会新建会话。模型由 `models::resolve_model` 校验，不静默替换。
+//! super-agent 的会话自行维护上下文。**流式**请求带显式会话 ID（body 字段或
+//! `x-session-id` 头）时按账号、密钥、模型、工作目录、工具定义与网关调用方隔离，
+//! 只发历史新增部分（不重发 system / 工具 schema / 上游自己的回复）；复用会话
+//! 上投递失败时作废会话，用新会话 + 全量历史重试一次。无会话 ID 或非流式请求
+//! 每请求独立；历史改写或完全重复也新建会话。模型由 `models::resolve_model`
+//! 校验，不静默替换。
 //!
 //! ── token 记账 ──────────────────────────────────────────────
-//! 原实现从 `step-finish` part 的 `tokens` 字典提取输入/输出 token，
-//! 但该字典的形态在参考实现里没有固定 schema（`part.get("tokens", {})`
-//! 后直接存）。本移植**不解析它**（强行按猜测的字段读，不如不记），
-//! 只做请求/响应的 telemetry 捕获（与 kuku 同口径）。
+//! 见 `stream.rs`：`step-finish.tokens` 累加，拿不到时按字符估算，两路都
+//! `report_usage`。
 //!
 //! ── 硬约束 ──────────────────────────────────────────────────
 //! release 是 `panic=abort`：本文件零 unwrap/expect/panic；持锁不跨 await。
 
 use std::sync::Arc;
 
+use axum::http::HeaderMap;
 use serde_json::Value;
 
 use crate::server::core::account_store::AccountStore;
@@ -35,6 +37,7 @@ use crate::server::core::upstream::usage::RequestTelemetry;
 use crate::server::core::upstream::ForwardOutcome;
 use crate::server::errors::GatewayError;
 
+use super::session::Turn;
 use super::{models, protocol, stream, teleagent_id};
 
 /// 转发入口（有状态路径 `forward_conversation` 转调）。
@@ -48,6 +51,7 @@ pub async fn run_chat(
     store: &AccountStore,
     account_id: &str,
     body: &Value,
+    headers: &HeaderMap,
     _proxy: Option<ResolvedProxy>,
     stream: bool,
     telemetry: &Arc<RequestTelemetry>,
@@ -69,40 +73,28 @@ pub async fn run_chat(
     } else {
         client_model.clone()
     };
-    let tools = if body.get("tool_choice").and_then(Value::as_str) == Some("none") {
-        None
-    } else {
-        body.get("tools")
-    };
-    let tools_enabled = tools.and_then(Value::as_array).is_some_and(|items| !items.is_empty());
+    // 工具 schema 只看有没有定义（建会话时注入一次）；tool_choice 是逐轮提示。
+    let tools = body.get("tools").filter(|v| v.as_array().is_some_and(|items| !items.is_empty()));
+    let tools_enabled = tools.is_some() && body.get("tool_choice").and_then(Value::as_str) != Some("none");
     let directory = protocol::default_directory();
     let model_key = format!("{provider_id}/{model_id}");
     let fingerprints = super::session::fingerprints(body.get("messages"));
-    let mut conversation = match super::session::entry(account_id, &key, &model_key, &directory, body) {
-        Some(state) => Some(state.lock_owned().await),
-        None => None,
-    };
-    if body.get("reset_session").and_then(Value::as_bool) == Some(true) {
-        if let Some(state) = conversation.as_mut() { state.reset(); }
-    }
-    let reuse = conversation.as_ref().and_then(|state| {
-        let id = state.session_id.as_ref()?;
-        let start = super::session::delta_start(&state.sent, &fingerprints)?;
-        Some((id.clone(), start))
-    });
-    let (session_id, prompt) = if let Some((id, start)) = reuse {
-        let messages = super::session::incremental_messages(body, start);
-        (id, protocol::build_prompt(messages.as_ref(), tools))
+    // 只有「流式 + 显式会话 ID」才复用；非流式辅助请求不读写会话映射（CatPaw 同口径）。
+    let slot = if stream {
+        super::session::entry(account_id, &key, &model_key, &directory, body, headers)
     } else {
-        if let Some(state) = conversation.as_mut() { state.reset(); }
-        let id = protocol::create_session_with_key(&directory, &key).await?;
-        (id, protocol::build_prompt(body.get("messages"), tools))
+        None
     };
+    // 排队上限 30 秒（超时 409）、可取消；未 commit 就 drop → 会话作废（B1）。
+    let mut turn = Turn::acquire(slot, telemetry, "TeleAgent").await?;
+    if body.get("reset_session").and_then(Value::as_bool) == Some(true) {
+        turn.reset();
+    }
 
     // 先建立事件监听再投递消息，减少漏掉早期 delta 的竞态。
     let event_stream = stream::open_event_stream_with_key(&key).await?;
-    protocol::prompt_async_with_key(&session_id, &prompt, &directory, &provider_id, &model_id, &key)
-        .await?;
+    let target = Target { directory: &directory, provider_id: &provider_id, model_id: &model_id, key: &key };
+    let (session_id, prompt) = open_turn(&mut turn, &fingerprints, body, tools, &target).await?;
 
     if let Some(capture) = telemetry.capture().as_deref() {
         let url = format!(
@@ -115,17 +107,65 @@ pub async fn run_chat(
         capture.attach_response(event_stream.status().as_u16(), event_stream.headers());
     }
 
+    let options = stream::TurnOptions {
+        model: display_model,
+        session_id,
+        tools_enabled,
+        key: key.clone(),
+        manual: super::confirmations::manual_enabled(body),
+        prompt,
+    };
     if stream {
-        Ok(stream::stream_outcome(
-            event_stream, &display_model, &session_id, tools_enabled, &key,
-            conversation, fingerprints,
-        ))
+        Ok(stream::stream_outcome(event_stream, options, turn, fingerprints, Arc::clone(telemetry)))
     } else {
-        let result = stream::aggregate(event_stream, &display_model, &session_id, tools_enabled, &key).await;
-        if let Some(state) = conversation.as_mut() {
-            if result.is_ok() { state.commit(session_id, fingerprints); }
-            else { state.reset(); }
-        }
+        // 非流式不持有会话（见上），`turn` 是空持有。
+        let result = stream::aggregate(event_stream, &options, telemetry).await;
+        drop(turn);
         result
     }
+}
+
+/// 上游投递目标（同一把 key 签名）。
+struct Target<'a> {
+    directory: &'a str,
+    provider_id: &'a str,
+    model_id: &'a str,
+    key: &'a str,
+}
+
+/// 能复用就投递增量；复用会话上投递失败（会话被删、过期等）时作废，
+/// 用新会话 + 全量历史重试一次。认证失败（401）不重试，交给编排层处理。
+async fn open_turn(
+    turn: &mut Turn,
+    fingerprints: &[String],
+    body: &Value,
+    tools: Option<&Value>,
+    target: &Target<'_>,
+) -> Result<(String, String), GatewayError> {
+    if let Some((id, start)) = turn.reusable(fingerprints) {
+        if let Some(messages) = super::session::incremental_messages(body, start) {
+            // system 与工具 schema 建会话时已发，增量只带新消息 + 本轮 tool_choice 提示。
+            let prompt = protocol::turn_prompt(Some(&messages), None, body);
+            match protocol::prompt_async_with_key(
+                &id, &prompt, target.directory, target.provider_id, target.model_id, target.key,
+            )
+            .await
+            {
+                Ok(()) => return Ok((id, prompt)),
+                Err(error) if error.status_code == 401 => return Err(error),
+                Err(error) => crate::server::logging::verbose(
+                    "[TeleAgent]",
+                    &format!("复用会话投递失败（{}），改用新会话 + 全量历史重试", error.message),
+                ),
+            }
+        }
+    }
+    turn.reset();
+    let id = protocol::create_session_with_key(target.directory, target.key).await?;
+    let prompt = protocol::turn_prompt(body.get("messages"), tools, body);
+    protocol::prompt_async_with_key(
+        &id, &prompt, target.directory, target.provider_id, target.model_id, target.key,
+    )
+    .await?;
+    Ok((id, prompt))
 }
