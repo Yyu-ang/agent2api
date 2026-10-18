@@ -1,0 +1,51 @@
+name: Provider protocol regressions
+
+on:
+  pull_request:
+    branches: [beta]
+    paths:
+      - '.github/workflows/provider-contract.yml'
+      - 'desktop-tauri/src-tauri/server/src/server/core/providers/tabbit/**'
+      - 'desktop-tauri/src-tauri/server/src/server/core/providers/teleagent/**'
+      - 'desktop-tauri/src-tauri/server/src/server/core/providers/stateful_session.rs'
+      - 'desktop-tauri/src-tauri/server/src/server/core/account_store/tabbit_accounts.rs'
+      - 'desktop-tauri/src-tauri/server/src/server/core/account_store/teleagent_accounts.rs'
+      - 'desktop-tauri/src-tauri/server/src/server/api/*.rs'
+      - 'desktop-tauri/src-tauri/server/src/server/http.rs'
+  push:
+    # 合入集成分支后继续守住回归（原先写死的特性分支合并后就失效了）
+    branches: [beta]
+    paths:
+      - '.github/workflows/provider-contract.yml'
+      - 'desktop-tauri/src-tauri/server/src/server/core/providers/tabbit/**'
+      - 'desktop-tauri/src-tauri/server/src/server/core/providers/teleagent/**'
+      - 'desktop-tauri/src-tauri/server/src/server/core/providers/stateful_session.rs'
+      - 'desktop-tauri/src-tauri/server/src/server/core/account_store/tabbit_accounts.rs'
+      - 'desktop-tauri/src-tauri/server/src/server/core/account_store/teleagent_accounts.rs'
+      - 'desktop-tauri/src-tauri/server/src/server/api/*.rs'
+      - 'desktop-tauri/src-tauri/server/src/server/http.rs'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  provider-contracts:
+    runs-on: ubuntu-latest
+    # 在 workspace 目录里跑：这样 desktop-tauri/src-tauri/.cargo/config.toml 才会生效
+    # （target-dir = ../../target，即仓库根的 target/），与下面 rust-cache 的路径一致。
+    # 从仓库根用 --manifest-path 跑时 cargo 不读这份配置，产物会落到
+    # desktop-tauri/src-tauri/target，缓存永远不命中。
+    defaults:
+      run:
+        working-directory: desktop-tauri/src-tauri
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: desktop-tauri/src-tauri -> ../../target
+      - name: Compile gateway
+        run: cargo check --manifest-path server/Cargo.toml --lib --tests
+      - name: Verify provider regression tests
+        run: cargo test --manifest-path server/Cargo.toml --lib parity_tests

@@ -11,9 +11,9 @@
 //!     压成单条 prompt 文本：system 拼接在前、assistant 前缀 `[assistant]`、
 //!     tool 结果前缀 `[tool_result]`，与原实现逐字同口径）。
 //!
-//! 不搬的：`get_or_create_session` 的标题复用（机器人场景的；网关每次请求
-//! 独立会话，见 `chat.rs`）、`reply_permission` / `reply_question`（网关无法
-//! 代用户做确认，见 `stream.rs` 的处置）、`get_messages`（排障用，不需要）。
+//! 会话复用按明确 conversation_id 进行（见 `session.rs`）；权限/问题确认
+//! 通过 `confirmations.rs` 和 `reply_confirmation_with_key` 交给用户处理。
+//! 未移植基于标题模糊匹配会话（容易跨用户串线）与完整上游消息浏览。
 //!
 //! ── 硬约束 ──────────────────────────────────────────────────
 //! release 是 `panic=abort`：本文件零 unwrap/expect/panic；持锁不跨 await。
@@ -224,7 +224,7 @@ async fn signed_request_with_key(
 }
 
 /// 一次带签名的 JSON 请求（显式 key 版），返回已解析的 body（2xx 才算成功）。
-async fn signed_json_with_key(
+pub(crate) async fn signed_json_with_key(
     method: &str,
     path: &str,
     body: Option<&Value>,
@@ -359,7 +359,7 @@ pub fn default_directory() -> String {
 ///     `image_understanding` 工具查看 —— 这里目录改名 `teleagent_vision`，
 ///     其余逐字保留）；
 ///   - 只有一条 user 且无 system 时直接用那条内容，否则 `\n\n` 连接。
-pub fn build_prompt(messages: Option<&Value>) -> String {
+pub fn build_prompt(messages: Option<&Value>, tools: Option<&Value>) -> String {
     let mut system_content: Option<String> = None;
     let mut user_messages: Vec<String> = Vec::new();
 
@@ -375,10 +375,33 @@ pub fn build_prompt(messages: Option<&Value>) -> String {
                     });
                 }
                 "user" => user_messages.push(content),
-                "assistant" => user_messages.push(format!("[assistant] {content}")),
-                "tool" => user_messages.push(format!("[tool_result] {content}")),
+                "assistant" => user_messages.push(assistant_text(message, &content)),
+                "tool" => user_messages.push(tool_result_text(message, &content)),
                 _ => user_messages.push(content),
             }
+        }
+    }
+
+    // 按参考代理的约定，将 function schema 注入 TeleAgent 文本提示词。
+    if let Some(Value::Array(definitions)) = tools {
+        let mut descriptions = Vec::new();
+        for tool in definitions {
+            let function = tool.get("function").unwrap_or(tool);
+            let name = function.get("name").and_then(Value::as_str).unwrap_or("");
+            if name.trim().is_empty() { continue; }
+            let description = function.get("description").and_then(Value::as_str).unwrap_or("");
+            let parameters = function.get("parameters").cloned().unwrap_or_else(|| json!({}));
+            descriptions.push(format!("  - {name}: {description}\n    参数: {parameters}"));
+        }
+        if !descriptions.is_empty() {
+            let instruction = format!(
+                "你可以使用以下工具：\n\n{}\n\n需要调用工具时请只输出：[TOOL_CALL]{{\"name\":\"工具名称\",\"arguments\":{{}}}}[/TOOL_CALL]\n不需要调用工具时正常回复。",
+                descriptions.join("\n")
+            );
+            system_content = Some(match system_content {
+                Some(existing) => format!("{existing}\n\n{instruction}"),
+                None => instruction,
+            });
         }
     }
 
@@ -394,6 +417,84 @@ pub fn build_prompt(messages: Option<&Value>) -> String {
         return "你好".to_string();
     }
     parts.join("\n\n")
+}
+
+/// 历史里的 assistant 消息：正文 + 它当时发起的工具调用（按同一套
+/// `[TOOL_CALL]` 文本协议还原，带 id，模型才能把后面的 tool 结果对上号）。
+fn assistant_text(message: &Value, content: &str) -> String {
+    let mut text = format!("[assistant] {content}");
+    let calls = message.get("tool_calls").and_then(Value::as_array);
+    for call in calls.into_iter().flatten() {
+        let function = call.get("function").unwrap_or(call);
+        let name = function.get("name").and_then(Value::as_str).unwrap_or("");
+        if name.is_empty() {
+            continue;
+        }
+        let arguments = match function.get("arguments") {
+            Some(Value::String(raw)) => serde_json::from_str::<Value>(raw).unwrap_or_else(|_| json!(raw)),
+            Some(other) => other.clone(),
+            None => json!({}),
+        };
+        let mut marker = json!({"name": name, "arguments": arguments});
+        if let Some(id) = call.get("id").and_then(Value::as_str).filter(|id| !id.is_empty()) {
+            marker["id"] = json!(id);
+        }
+        text.push_str(&format!("\n[TOOL_CALL]{marker}[/TOOL_CALL]"));
+    }
+    text
+}
+
+/// 历史里的 tool 结果：带上 `tool_call_id` / `name`，与上面的调用一一对应。
+fn tool_result_text(message: &Value, content: &str) -> String {
+    let id = message.get("tool_call_id").and_then(Value::as_str).unwrap_or("");
+    let name = message.get("name").and_then(Value::as_str).unwrap_or("");
+    let mut label = String::from("[tool_result");
+    if !id.is_empty() {
+        label.push_str(&format!(" tool_call_id={id}"));
+    }
+    if !name.is_empty() {
+        label.push_str(&format!(" name={name}"));
+    }
+    format!("{label}] {content}")
+}
+
+/// OpenAI `tool_choice` → 逐轮提示（工具 schema 只在建会话时注入一次，
+/// 这条提示每轮都追加在 prompt 末尾）。`auto` / 缺省 / 没有工具 → None。
+pub fn tool_choice_hint(body: &Value) -> Option<String> {
+    let has_tools = body.get("tools").and_then(Value::as_array).is_some_and(|items| !items.is_empty());
+    if !has_tools {
+        return None;
+    }
+    match body.get("tool_choice")? {
+        Value::String(choice) => match choice.as_str() {
+            "none" => Some("本轮不要调用任何工具，直接回答。".to_string()),
+            "required" | "any" => Some(
+                "本轮必须调用至少一个工具：只输出 [TOOL_CALL]{\"name\":\"工具名称\",\"arguments\":{}}[/TOOL_CALL] 片段。".to_string(),
+            ),
+            _ => None,
+        },
+        Value::Object(choice) => {
+            let name = choice
+                .get("function")
+                .and_then(|f| f.get("name"))
+                .or_else(|| choice.get("name"))
+                .and_then(Value::as_str)
+                .filter(|name| !name.trim().is_empty())?;
+            Some(format!(
+                "本轮必须调用工具 {name}：只输出 [TOOL_CALL]{{\"name\":\"{name}\",\"arguments\":{{}}}}[/TOOL_CALL] 片段。"
+            ))
+        }
+        _ => None,
+    }
+}
+
+/// 一轮的 prompt：`build_prompt` 之后追加 tool_choice 提示（如有）。
+pub fn turn_prompt(messages: Option<&Value>, tools: Option<&Value>, body: &Value) -> String {
+    let prompt = build_prompt(messages, tools);
+    match tool_choice_hint(body) {
+        Some(hint) => format!("{prompt}\n\n{hint}"),
+        None => prompt,
+    }
 }
 
 /// 取一条消息的文本（`content` 字符串 / text 部件数组 / image_url 临时文件）。
@@ -458,5 +559,62 @@ fn image_part_text(image_url: Option<&Value>) -> String {
         )
     } else {
         "[图片解析失败]".to_string()
+    }
+}
+
+
+/// 回复需要人工确认的 TeleAgent permission/question。只接受服务器刚发出的 ID。
+pub(crate) async fn reply_confirmation_with_key(
+    kind: &str,
+    id: &str,
+    payload: &Value,
+    key: &str,
+) -> Result<(), GatewayError> {
+    if !matches!(kind, "permission" | "question")
+        || id.is_empty()
+        || id.len() > 256
+        || !id.bytes().all(|b| b.is_ascii_alphanumeric() || b"-_".contains(&b))
+    {
+        return Err(GatewayError::with_status(400, "TeleAgent 确认类型或 ID 非法"));
+    }
+    let path = format!("/{kind}/{id}/reply");
+    let (status, body) = signed_request_with_key("POST", &path, Some(payload), 10_000, key).await?;
+    if matches!(status, 200 | 204) {
+        Ok(())
+    } else {
+        Err(GatewayError::with_status(
+            status as i32,
+            format!("TeleAgent 确认回复失败（HTTP {status}）：{}", body.chars().take(200).collect::<String>()),
+        ))
+    }
+}
+
+#[cfg(test)]
+mod parity_tests {
+    use super::{build_prompt, tool_choice_hint, turn_prompt};
+    use serde_json::json;
+
+    #[test]
+    fn tool_history_keeps_call_ids_and_results() {
+        let messages = json!([
+            {"role":"user","content":"weather?"},
+            {"role":"assistant","content":null,"tool_calls":[{"id":"call_9","type":"function","function":{"name":"get_weather","arguments":"{\"city\":\"SH\"}"}}]},
+            {"role":"tool","tool_call_id":"call_9","name":"get_weather","content":"sunny"}
+        ]);
+        let prompt = build_prompt(Some(&messages), None);
+        assert!(prompt.contains(r#""id":"call_9""#), "{prompt}");
+        assert!(prompt.contains(r#""city":"SH""#), "{prompt}");
+        assert!(prompt.contains("[tool_result tool_call_id=call_9 name=get_weather] sunny"), "{prompt}");
+    }
+
+    #[test]
+    fn tool_choice_variants_become_turn_hints() {
+        let tools = json!([{"type":"function","function":{"name":"run"}}]);
+        assert!(tool_choice_hint(&json!({"tools": tools, "tool_choice":"auto"})).is_none());
+        assert!(tool_choice_hint(&json!({"tool_choice":"required"})).is_none(), "没有工具时不提示");
+        let required = tool_choice_hint(&json!({"tools": tools, "tool_choice":"required"})).unwrap_or_default();
+        assert!(required.contains("必须调用"));
+        let named = json!({"tools": tools, "tool_choice":{"type":"function","function":{"name":"run"}}});
+        assert!(turn_prompt(Some(&json!([{"role":"user","content":"go"}])), None, &named).ends_with("[/TOOL_CALL] 片段。"));
     }
 }

@@ -11,8 +11,8 @@
 //! ── 有状态 ──────────────────────────────────────────────────
 //! `is_stateful()` 为 true：上游一次对话 = 建会话 → prompt_async → SSE
 //! 三步，塞不进单请求契约（`build_chat_request` 返回 503 防御，理由与
-//! KukuAI / CatPaw 相同）。会话是**请求内**的（新建即用、用毕即弃），
-//! 因此没有会话注册表 / 轮次状态机。
+//! KukuAI / CatPaw 相同）。默认每请求新建会话；流式请求带显式会话 ID
+//! （body 或 `x-session-id` 头）时复用，注册表在 `session.rs`。
 //!
 //! ── 凭证：session key（账号里存的 / 自动提取的） ─────────────
 //!   - `ensure_access_token`：有账号 → 账号里存的 key；无账号 →
@@ -57,8 +57,8 @@ use crate::server::core::providers::adapter::{
 };
 use crate::server::core::providers::{kind_id, ProviderKind};
 
-/// TeleAgent 适配器（无状态单例：会话是请求内的，凭证是进程级 key 缓存，
-/// 本结构不持有任何字段）。
+/// TeleAgent 适配器（无字段单例：会话注册表在 `session.rs`，凭证是进程级
+/// key 缓存，本结构不持有任何字段）。
 pub struct TeleAgentAdapter;
 
 /// 进程级实例（`adapter_for` 返回它的 `&'static` 引用）
@@ -149,7 +149,13 @@ impl ProviderAdapter for TeleAgentAdapter {
     /// ——「获取模型」弹窗不显示无意义的账号下拉
     /// （与 [`Self::refresh_models`] 的参数配对，见 trait 文档）。
     fn refresh_uses_account(&self) -> bool {
-        false
+        true
+    }
+
+    /// 会话式转发需对认证失败分类，不能落入 trait 默认 Fatal 分支。
+    fn classify_conversation_error(&self, error: &GatewayError) -> UpstreamErrorClass {
+        let status = error.status_code.clamp(0, u16::MAX as i32) as u16;
+        self.classify_error(status, &serde_json::json!({"message": error.message}))
     }
 
     /// 凭证：session key。
@@ -226,7 +232,7 @@ impl ProviderAdapter for TeleAgentAdapter {
         store: &'a AccountStore,
         account_id: &'a str,
         body: &'a Value,
-        _client_headers: &'a HeaderMap,
+        client_headers: &'a HeaderMap,
         proxy: Option<ResolvedProxy>,
         stream: bool,
         telemetry: &'a Arc<RequestTelemetry>,
@@ -237,6 +243,8 @@ impl ProviderAdapter for TeleAgentAdapter {
                 + 'a,
         >,
     > {
-        Box::pin(async move { chat::run_chat(store, account_id, body, proxy, stream, telemetry).await })
+        Box::pin(async move {
+            chat::run_chat(store, account_id, body, client_headers, proxy, stream, telemetry).await
+        })
     }
 }

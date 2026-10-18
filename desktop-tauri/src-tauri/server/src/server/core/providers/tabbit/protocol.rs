@@ -54,7 +54,7 @@ const SIGN_KEY_TTL_SECS: i64 = 1800;
 
 /// 签名 key 兜底（`GET /chat/sign-key` 失败时用；参考实现 `FALLBACK_SIGN_KEY`）。
 /// 注意：兜底 key 只是让请求能发出去，服务端大概率回 499 → 触发刷新重试。
-const FALLBACK_SIGN_KEY: &str = "tabbit-fallback-sign-key";
+const FALLBACK_SIGN_KEY: &str = "f8d0e6a73f8d4b1a9c3d2e1f9a4b7c6d";
 
 /// unique-uuid 里的时间编码位
 const TS_POSITIONS: [usize; 8] = [2, 7, 11, 14, 18, 21, 25, 28];
@@ -230,36 +230,21 @@ pub fn make_unique_uuid(is_default_browser: bool) -> String {
     let now_secs = crate::server::logging::now_ms() / 1000;
     let ts_hex = format!("{:08x}", now_secs as u32);
     let ts_chars: Vec<char> = ts_hex.chars().collect();
+    let entropy = random_bytes(32);
+    let hex = b"0123456789abcdef";
+    let non_default = b"023456789abcdef";
     let mut out = String::with_capacity(36);
-    let mut hex_i = 0u64;
     for i in 0..32 {
+        let random = entropy.get(i).copied().unwrap_or(0) as usize;
         let ch = if i == 5 {
-            if is_default_browser {
-                '1'
-            } else {
-                // 0-9a-f 去掉 '1' 后轮转取一位（确定性，不伪造）
-                let others = "023456789abcdef";
-                others
-                    .chars()
-                    .nth((hex_i % 15) as usize)
-                    .unwrap_or('0')
-            }
+            if is_default_browser { '1' } else { non_default[random % non_default.len()] as char }
         } else if let Some(pos) = TS_POSITIONS.iter().position(|&p| p == i) {
             ts_chars.get(pos).copied().unwrap_or('0')
         } else {
-            hex_i = hex_i.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
-            "0123456789abcdef"
-                .chars()
-                .nth((hex_i % 16) as usize)
-                .unwrap_or('0')
+            hex[random % hex.len()] as char
         };
-        if !is_default_browser || i != 5 {
-            hex_i = hex_i.wrapping_add(1);
-        }
         out.push(ch);
-        if matches!(i, 7 | 11 | 15 | 19) {
-            out.push('-');
-        }
+        if matches!(i, 7 | 11 | 15 | 19) { out.push('-'); }
     }
     out
 }

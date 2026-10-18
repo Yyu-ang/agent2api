@@ -109,6 +109,26 @@ pub async fn post_json_value(
     http_json(response, url, "Tabbit").await
 }
 
+/// Tabbit 建会话请求必须是空 body；JSON "{}" 与零字节并不等价。
+pub async fn post_empty_value(
+    url: &str,
+    headers: &[(String, String)],
+    proxy: Option<&ResolvedProxy>,
+    timeout_ms: Option<u64>,
+) -> Result<Value, GatewayError> {
+    let client = egress::client_for(proxy);
+    let mut request = client.post(url).header("Accept", "application/json");
+    for (name, value) in headers {
+        request = request.header(name.as_str(), value.as_str());
+    }
+    if let Some(timeout) = timeout_ms {
+        request = request.timeout(std::time::Duration::from_millis(timeout));
+    }
+    let response = request.body(Vec::<u8>::new()).send().await
+        .map_err(|error| transport_error("Tabbit 建会话", error))?;
+    http_json(response, url, "Tabbit").await
+}
+
 /// 一次 SSE POST（`stream_mode: "sse"`），返回原始响应（调用方逐帧解析）。
 ///
 /// 499（签名 key 过期）**不**在这里翻译：调用方刷新 key 后重试一次

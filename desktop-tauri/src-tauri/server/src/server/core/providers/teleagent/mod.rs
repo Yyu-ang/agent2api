@@ -19,8 +19,16 @@
 //! ── 与 KukuAI 同属「有状态」但更彻底 ──────────────────────────
 //! `is_stateful()` 为 true：一次对话 = 建会话 → 发消息 → SSE 三步，
 //! 塞不进单请求契约（`build_chat_request` 返回 503 防御）。
-//! 会话是**请求内**的（每次新建、用毕即弃，不跨请求复用 —— 网关一次转发
-//! 就是一个独立客户端请求，复用会话会让不同客户端的上下文串味）。
+//! 默认每请求新建会话（没有身份的请求复用会让不同客户端的上下文串味）；
+//! **流式**请求带显式会话 ID（body `conversation_id` / `metadata.*` 或
+//! `x-session-id` 头）时，按账号、密钥、模型、目录、工具定义与网关调用方
+//! 隔离复用，只发增量；复用失败自动作废并以新会话 + 全量重试一次（`session.rs`）。
+//!
+//! ── 人工确认（permission / question）─────────────────────────
+//! 默认与旧版一致：上游请求用户确认时立即中断本轮并报 502。显式开启
+//! （设置 `teleagentManualConfirmation`、环境变量
+//! `AGENT2API_TELEAGENT_MANUAL_CONFIRM=1` 或请求 `metadata.teleagent_manual_confirmation`）
+//! 后改为登记进受保护的确认队列，等待管理页 / API 回复（见 `confirmations.rs`）。
 //!
 //! ── 凭证：session key（账号里存的 / 本机自动提取） ────────────
 //! 凭证就是 super-agent 的 session key：账号页手动粘贴（添加时探活）、
@@ -42,9 +50,11 @@
 pub mod adapter;
 pub mod auth;
 pub mod chat;
+pub mod confirmations;
 pub mod models;
 pub mod protocol;
 pub mod stream;
+pub mod session;
 
 /// super-agent 的监听地址（teleagent-openai-proxy 写死的常量）
 pub const SUPER_AGENT_HOST: &str = "127.0.0.1";

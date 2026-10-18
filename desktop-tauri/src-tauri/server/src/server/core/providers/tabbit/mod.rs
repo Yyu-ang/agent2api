@@ -17,8 +17,10 @@
 //!
 //! ── 转发路线 ──────────────────────────────────────────────────
 //! 有状态（`is_stateful = true`）：建会话 → 签名 POST → SSE 的两步时序塞不进
-//! 单请求契约，走 `forward_conversation`（`chat.rs`）；会话是请求内的，
-//! 不跨请求保持状态（与 KukuAI 同形态）。
+//! 单请求契约，走 `forward_conversation`（`chat.rs`）。默认每请求独立建会话；
+//! **流式**请求带显式会话 ID（body `conversation_id` / `metadata.*` 或
+//! `x-session-id` 头）时跨请求复用上游会话、只发增量（`session.rs`）。
+//! 复用失败自动作废并以新会话 + 全量重试一次；非流式辅助请求不读写会话。
 //!
 //! ── 账号 ──────────────────────────────────────────────────────
 //! 粘贴 Cookie（`token`）/ 网页登录（官方登录页 + 壳侧读 Cookie 收尾）。
@@ -30,6 +32,7 @@
 //!   http.rs        出站请求的薄封装（JSON / 纯文本 / SSE）
 //!   credentials.rs 凭证解析与快照
 //!   models.rs      模型目录（静态兜底 + 远程刷新）
+//!   session.rs     显式会话 ID → 上游会话的复用注册表（通用部分在 `stateful_session`）
 //!   chat.rs        会话式转发（建会话 → SSE → OpenAI 形状）
 //!   balance.rs     额度查询
 //!   login.rs       网页登录
@@ -47,6 +50,7 @@ pub mod login;
 pub mod models;
 pub mod protocol;
 pub mod region;
+pub mod session;
 
 pub use region::Region;
 
