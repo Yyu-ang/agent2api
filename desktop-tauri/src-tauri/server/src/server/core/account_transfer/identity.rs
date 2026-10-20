@@ -176,6 +176,20 @@ pub(super) fn identity_of_item(provider: &str, item: &Map<String, Value>) -> Res
         }
         return Err("缺少 uid 与 loginName（无法标识 Kuku 账号）".to_string());
     }
+    // MiniMax Code：账号标识是 `uid`（JWT 的 `account_id` 落盘键），缺则
+    // email —— 与 Kuku 同一套字段口径。没有这一支会落进兜底按 `userId`
+    // 取，而本家记录没有该字段：账号导得出去、导不回来（报「缺少 userId」
+    // 整条失败）。两个地区共用这一支（判据是「属于 MiniMax Code 系」）。
+    if crate::server::core::account_store::is_minimaxcode_family(provider) {
+        if !uid.is_empty() {
+            return Ok(uid);
+        }
+        let email = text("email");
+        if !email.is_empty() {
+            return Ok(email);
+        }
+        return Err("缺少 uid 与 email（无法标识 MiniMax Code 账号）".to_string());
+    }
     // Cline 的账号标识落在 `account`（邮箱或 `usr-…` id）而不是 `userId`
     // —— 见 `account_store::cline_accounts` 的公开形态。少了这一支，
     // Cline 账号导出后再导入会因「缺少 userId」整条失败。
@@ -297,6 +311,21 @@ pub(super) fn identity_of_record(provider: &str, record: &StoredAccount) -> Opti
             return Some(uid);
         }
         return (!login_name.is_empty()).then_some(login_name);
+    }
+    // MiniMax Code：uid（缺则 email）—— 与 `identity_of_item` 同口径，
+    // 两个地区共用这一支
+    if crate::server::core::account_store::is_minimaxcode_family(provider) {
+        let uid = record.uid().trim().to_string();
+        if !uid.is_empty() {
+            return Some(uid);
+        }
+        let email = record
+            .get("email")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        return (!email.is_empty()).then_some(email);
     }
     // Trae：`uid` + variant 两段身份（与 `identity_of_item` 同口径 —— 两处
     // 缺省都必须按 `solo` 算，否则导出去的同一条账号会在判重时对不上）。

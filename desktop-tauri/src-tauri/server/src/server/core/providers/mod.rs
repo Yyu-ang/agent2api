@@ -140,6 +140,11 @@ pub mod content_block;
 pub mod custom;
 pub mod kuku;
 pub mod loomy;
+/// MiniMax Code（MiniMax 的编程订阅客户端 mcode）：OAuth 设备流 + PKCE
+/// 登录、refresh token 单次使用、Mavis 通道 Anthropic 无状态转发。
+/// 两个地区是两套账号体系，按两家建模共用一份参数化实现，见
+/// `minimaxcode/mod.rs` 的模块头（含功能对照与已知缺口）。
+pub mod minimaxcode;
 /// MonkeyCode（长亭科技的开源 AI 开发平台）。适配实现在 `monkeycode/`：
 /// 账号管理（粘贴 session）+ 模型目录（`GET /api/v1/users/models`）+
 /// **会话转发**（上游是「建任务 → WebSocket 任务流」，ACP 事件翻译为 chat 帧，
@@ -549,6 +554,18 @@ pub enum ProviderKind {
     /// 智谱清言这一家只有 `chatglm.cn` 一个站点（测试域 `test.chatglm.cn`
     /// 是**环境**不是地区，靠 `CHATGLM_BASE_URL` 覆盖即可）。
     Chatglm,
+    /// MiniMax Code **国内版**（`minimax-code`）。适配实现在 `minimaxcode/`：
+    /// OAuth 设备流 + PKCE 登录（`account.minimax.cn`）、refresh token
+    /// 单次使用、对话走 Mavis 通道（`agent.minimax.cn` 的 Anthropic
+    /// Messages 接口）无状态转发；用量是 M Plan 窗口 remains，每日签到走
+    /// 签名账号 API，见 `minimaxcode/mod.rs` 的模块头。
+    MinimaxCode,
+    /// MiniMax Code **国际版**（`minimax-code-global`）：站点全在 `.io`
+    /// （account / agent / platform），与国内版是两套独立账号体系。
+    /// 地区不是账号的属性而是身份本身，因此按两家建模（与 Tabbit 同理）；
+    /// 地区 ↔ 站点的互查在 `minimaxcode::region::Region`，不要在别处写
+    /// `"minimax-code-global"` 这类字面量。
+    MinimaxCodeGlobal,
 }
 
 /// 一个提供商的静态元数据。
@@ -658,6 +675,11 @@ pub const PROVIDERS: &[ProviderMeta] = &[
     // 大面积同名 —— 靠末位让同名模型优先归已有各家（那些是开放平台账号，
     // 配额与稳定性都比本家的消费级网页端好）。
     ProviderMeta { id: "chatglm", label: "智谱清言" },
+    // MiniMax Code 两个地区**相邻**排列（国内版在前），排在末尾（2026-10
+    // 接入，后到居后）：它的模型名（MiniMax-M3 / M2.7 等）可能与别家同名，
+    // 靠末位让同名模型优先归已有各家。
+    ProviderMeta { id: "minimax-code", label: "MiniMax Code 国内版" },
+    ProviderMeta { id: "minimax-code-global", label: "MiniMax Code 国际版" },
 ];
 
 /// provider id 在注册表里的下标（未知 id → None）。
@@ -746,6 +768,8 @@ pub fn kind_from_id(id: &str) -> Option<ProviderKind> {
         "tabbit-intl" => Some(ProviderKind::TabbitIntl),
         "orcaterm" => Some(ProviderKind::OrcaTerm),
         "chatglm" => Some(ProviderKind::Chatglm),
+        "minimax-code" => Some(ProviderKind::MinimaxCode),
+        "minimax-code-global" => Some(ProviderKind::MinimaxCodeGlobal),
         // 走到这里 = 上面的注册表判定已放行、这个 match 却没有对应分支：
         // 只可能是有人给 `PROVIDERS` 加了条目忘了加这里。开发期喊出来；
         // release 返回 None（见上：宁可为「未知」，不可误认成别家）。
@@ -792,6 +816,8 @@ pub const fn kind_id(kind: ProviderKind) -> &'static str {
         ProviderKind::TabbitIntl => "tabbit-intl",
         ProviderKind::OrcaTerm => "orcaterm",
         ProviderKind::Chatglm => "chatglm",
+        ProviderKind::MinimaxCode => "minimax-code",
+        ProviderKind::MinimaxCodeGlobal => "minimax-code-global",
     }
 }
 

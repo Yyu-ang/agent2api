@@ -212,6 +212,16 @@ pub(crate) fn refresh_meta(kind: ProviderKind) -> (bool, i64) {
             super::chatglm::models::remote_refreshed(),
             super::chatglm::models::last_refreshed_at(),
         ),
+        // MiniMax Code 两个地区各查自己那一格目录状态（两份缓存互不覆盖，
+        // 「来源 / 更新日期」如实分开，与 Qoder 拆家后的口径一致）
+        ProviderKind::MinimaxCode | ProviderKind::MinimaxCodeGlobal => {
+            let region = super::minimaxcode::region::Region::from_kind(kind)
+                .unwrap_or(super::minimaxcode::region::Region::Cn);
+            (
+                super::minimaxcode::models::remote_refreshed(region),
+                super::minimaxcode::models::last_refreshed_at(region),
+            )
+        }
     }
 }
 

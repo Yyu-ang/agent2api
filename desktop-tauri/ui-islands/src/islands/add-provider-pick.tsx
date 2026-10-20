@@ -103,6 +103,10 @@ export const PROVIDER_ICONS: Record<string, string> = {
   // （`assets/icon.png`，512×512，与系统里显示的应用图标为同一形象；
   // 归一成 256×256 入库 —— 与 officeace 同一处置）
   chatglm: 'assets/providers/chatglm.png',
+  // MiniMax Code：图标取自官方资产（国内版 / 国际版两张，与 preset 里的
+  // MiniMax 资产同源；两地是两个客户端形态，各用一张）
+  'minimax-code': 'assets/providers/minimax-cn.png',
+  'minimax-code-global': 'assets/providers/minimax.png',
 }
 
 /**

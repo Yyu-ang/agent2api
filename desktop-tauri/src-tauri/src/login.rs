@@ -668,9 +668,16 @@ fn allowed_hosts(provider: &str) -> Option<&'static [&'static str]> {
         // `localhost.weixin.qq.com` 的轮询 —— 主机不可穷举。**显式列出**
         // （落进默认分支会拿到 WorkBuddy 的白名单 → 授权页白屏，日志里什么也
         // 看不出）。
+        //
+        // MiniMax Code 两个地区同样不设限：设备授权页在
+        // `account.minimax.cn` / `account.minimax.io`，确认环节可能被
+        // MiniMax 的账号体系继续跳到手机号 / 邮箱验证等不可穷举的主机，
+        // 与 Cline（同为设备流）同一情形。它的完成判定不依赖窗口导航，
+        // 只看后端轮询结果（`providers::minimaxcode::login`）。
         "catpaw" | "qoder" | "qoder-intl" | "cline-free" | "cline-pass" | "autoclaw"
         | "autoclaw-intl" | "accio" | "accio-cn" | "zcode" | "zcode-intl" | "codearts" | "trae"
-        | "kuku" | "antigravity" | "officeace" | "tabbit" | "tabbit-intl" | "orcaterm" => None,
+        | "kuku" | "antigravity" | "officeace" | "tabbit" | "tabbit-intl" | "orcaterm"
+        | "minimax-code" | "minimax-code-global" => None,
         // WorkBuddy 的两个地区共用这一张表（表里 `workbuddy.ai` 那一行就是国际站
         // 的登录域）。**显式列出**而不是靠下面的默认分支：上面那条警告要求
         // 「新 provider 落到默认分支」必须是有意的选择，写出来才看得出是选过的
@@ -902,6 +909,14 @@ fn normalize_provider(provider: &str) -> Result<&'static str, String> {
         // `orcaterm://oauth_callback?session_id=…` 交回网关换令牌
         // （见 `start_orcaterm` 与 `providers/orcaterm/login.rs` 的模块头）。
         "orcaterm" => Ok("orcaterm"),
+        // MiniMax Code 两个地区：设备授权页由**后端**向账号站拿
+        // （`providers::minimaxcode::login::start`），壳侧只负责开窗口与
+        // 轮询 —— 与 Cline 的设备授权同一条路。授权页**没有任何回调落到
+        // 本机**，结果由后端轮询设备流端点得知；窗口最后停在哪儿都不
+        // 影响登录判定。漏了这一条前端点「网页登录」会直接报「不支持
+        // 网页登录的提供商」。
+        "minimax-code" => Ok("minimax-code"),
+        "minimax-code-global" => Ok("minimax-code-global"),
         other => Err(format!("不支持网页登录的提供商：{other}")),
     }
 }
