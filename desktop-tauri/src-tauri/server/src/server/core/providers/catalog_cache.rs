@@ -109,6 +109,11 @@ pub const SCOPE_OFFICEACE: &str = "officeace";
 /// 智谱清言（`chatglm.cn`）的模型目录缓存槽
 pub const SCOPE_CHATGLM: &str = "chatglm";
 
+/// MiniMax Code 国内版的模型目录缓存槽（两地区各一格，清单互不覆盖）
+pub const SCOPE_MINIMAX_CODE: &str = "minimaxCode";
+/// MiniMax Code 国际版的模型目录缓存槽
+pub const SCOPE_MINIMAX_CODE_GLOBAL: &str = "minimaxCodeGlobal";
+
 /// Zed（`cloud.zed.dev` 的 `GET /models`；单一站点、无地区之分，单格即可）
 pub const SCOPE_ZED: &str = "zed";
 
@@ -134,6 +139,8 @@ pub const ALL_SCOPES: &[&str] = &[
     SCOPE_ANTIGRAVITY,
     SCOPE_OFFICEACE,
     SCOPE_CHATGLM,
+    SCOPE_MINIMAX_CODE,
+    SCOPE_MINIMAX_CODE_GLOBAL,
     SCOPE_ZED,
 ];
 

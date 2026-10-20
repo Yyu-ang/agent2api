@@ -250,6 +250,17 @@ const PROVIDER_FEATURES: Record<string, ProviderFeatures> = {
   // `expiry: ''` —— 令牌有效期写在 JWT 的 `exp` 里、由网关自动续期，这一列没有
   //   可显示的事实（与 antigravity / kuku 同一处置），界面不渲染「有效期」。
   chatglm: { usage: true, creditDetail: true, edition: false, identifier: 'uid', expiry: '' },
+  // MiniMax Code 两个地区。各位各有出处：
+  // `usage: true` —— 有 M Plan 窗口读数（remains 的 interval/weekly 百分比窗口，
+  //   见后端 `providers::minimaxcode::balance`）；credits 余额在签名账号 API，
+  //   未接，因此不标 creditDetail。
+  // `edition: false` —— 地区已由 provider 本身区分（两家），标签里已带国内版 /
+  //   国际版，不再单出一列版本。
+  // `identifier: 'uid'` —— 账号标识存 uid（JWT 的 `account_id` 声明落盘键）。
+  // `expiry: 'expiresAt'` —— 有效期就是 access token 的过期时刻，落盘
+  //   `expiresAt`（毫秒），续期回写同步更新，界面可如实显示。
+  'minimax-code': { usage: true, edition: false, identifier: 'uid', expiry: 'expiresAt' },
+  'minimax-code-global': { usage: true, edition: false, identifier: 'uid', expiry: 'expiresAt' },
   // Zed（zed.dev 订阅）。各位各有出处：
   // `usage: true` —— 读数是**套餐名 + 账期结束**（`subscription.planName` /
   //   `subscription.expireAt`，见后端 `providers::zed::balance`）。Zed 不报

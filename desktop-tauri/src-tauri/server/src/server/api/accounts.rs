@@ -786,6 +786,26 @@ pub async fn add_account(state: &ServerState, body: &Bytes) -> Response {
                 store.add_cline_account(provider_id, &payload, import_name)
             }
         }
+        // MiniMax Code（两个地区）：**粘贴凭证**（accessToken + 可选
+        // refreshToken）→ 手动添加；「设备流登录」是另一条链路
+        // （`api::session::login_start` 的 MiniMax 分支 → 后端轮询 →
+        // 同一个落账号入口 `add_minimaxcode_account`）。
+        //
+        // `importDesktop` 不提供：mcode 没有可导入的桌面端登录态文件，
+        // 如实报错而不是装作导入成功。authFile 也不收：本家的凭证没有
+        // 「客户端设置文件」这种载体，粘贴 JSON 即是文件形态的等价物。
+        Some(kind @ (crate::server::core::providers::ProviderKind::MinimaxCode
+            | crate::server::core::providers::ProviderKind::MinimaxCodeGlobal)) => {
+            let provider_id = crate::server::core::providers::kind_id(kind);
+            if import_desktop {
+                Err(crate::server::core::account_store::AccountStoreError::new(
+                    "MiniMax Code 没有桌面端登录态可导入，请用「设备流登录」或粘贴凭证",
+                    400,
+                ))
+            } else {
+                store.add_minimaxcode_account(provider_id, &payload, import_name)
+            }
+        }
         // ZCode（两个地区）：**粘贴凭证**（`jwt` + `accessToken`）→ 手动添加；
         // 「网页登录」是另一条链路（`api::session::login_start` 的 ZCode 分支 →
         // `core::login::zcode` 的 CLI 轮询任务 → 同一个落账号入口

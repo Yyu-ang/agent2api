@@ -325,6 +325,39 @@ function clineForm(spec: { provider: string; label: string; poolNote: string }):
 }
 
 /**
+ * MiniMax Code 两个地区（国内版 / 国际版）：同一套设备流，只差站点。
+ * 地区不是账号的字段而是身份，因此输出两份配置（与 Accio 同一拆法）。
+ *
+ * 登录是 **OAuth 设备流 + PKCE**（与 Cline 同形）：没有回调、没有自定义
+ * 协议，「打开授权页 → 用户在页面上核对设备码并确认 → 网关轮询拿到
+ * 令牌」，因此内嵌窗口与系统浏览器两种打开方式都可行。
+ */
+function minimaxCodeForm(spec: { provider: string; label: string; site: string }): ProviderConfig {
+  const { provider, label, site } = spec
+  return {
+    provider,
+    label,
+    desktop: false,
+    webLogin: {
+      noteHtml: t('打开 MiniMax 授权页完成确认（授权页会显示设备码，核对一致再确认），账号自动加入 <b>{label}</b>。', { label }),
+      button: t('打开 MiniMax 授权页'),
+      busyText: t('等待 MiniMax 授权确认…'),
+      modes: [
+        { value: 'embedded', label: t('内嵌窗口（推荐）'), hint: t('内嵌窗口打开；完成后自动加入列表，关窗即取消等待') },
+        { value: 'external', label: t('系统浏览器'), hint: t('系统浏览器打开（复用已登录的 MiniMax 账号）；完成后自动加入列表') },
+      ],
+    },
+    manualTitle: t('粘贴凭证'),
+    manualNote: t('从 MiniMax Code 客户端（mcode）的登录态里取 accessToken 与 refreshToken。refreshToken **一次一换**：换发一次旧的即作废，所以不要让两个程序同时刷新同一个账号。当前是 {label}（账号站 {site}），两个地区是两套独立账号，凭证不通用。', { label, site }),
+    fields: [
+      { key: 'accessToken', label: 'accessToken', rows: 3, placeholder: t('粘贴 accessToken（JWT，三段点分）') },
+      { key: 'refreshToken', label: 'refreshToken', rows: 2, optional: true, placeholder: t('可选，没有则到期无法自动续期') },
+      { key: 'name', label: t('备注名'), optional: true, placeholder: t('可选，留空使用账号邮箱或站点名') },
+    ],
+  }
+}
+
+/**
  * Accio 两个地区（国际版 / 国内版）：同一个网关、同一套接口，只有登录站点与
  * x-package-region 头不同。地区不是账号的字段而是身份，因此输出两份配置。
  */
@@ -1050,6 +1083,10 @@ export const BUILTIN_CONFIGS: ProviderConfig[] = [
   // 智谱清言（chatglm.cn）：访客模式 / 粘贴令牌 / 导入本机登录态，排在末尾
   // （与后端注册表 PROVIDERS 的排列一致，2026-10 接入）
   CHATGLM,
+  // MiniMax Code（MiniMax 编程订阅）的两个地区相邻：国内版在前 —— 与后端
+  // 注册表 PROVIDERS 的追加顺序一致（2026-10 接入）。设备流登录 + 粘贴凭证。
+  minimaxCodeForm({ provider: 'minimax-code', label: 'MiniMax Code 国内版', site: 'account.minimax.cn' }),
+  minimaxCodeForm({ provider: 'minimax-code-global', label: 'MiniMax Code 国际版', site: 'account.minimax.io' }),
   // Zed（zed.dev 订阅）：网页登录（本机回调）/ 粘贴凭证，排在末尾
   // （与后端注册表 PROVIDERS 的排列一致，2026-10 接入）
   ZED,

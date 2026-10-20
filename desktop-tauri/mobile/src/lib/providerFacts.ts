@@ -46,6 +46,9 @@ const FACTS: Record<string, ProviderFacts> = {
   chatglm: { expiry: 'expiresAt', identifier: 'userId' },
   antigravity: { expiry: 'expiresAt', identifier: 'userId' },
   orcaterm: { expiry: 'expiresAt', identifier: 'userId' },
+  // MiniMax Code：有效期是 access token 的 expiresAt、标识存 uid（后端落盘口径）
+  'minimax-code': { expiry: 'expiresAt', identifier: 'uid' },
+  'minimax-code-global': { expiry: 'expiresAt', identifier: 'uid' },
   // Zed 没有有效期概念：访问令牌不带过期时间（expires=0），被拒才知道失效
   zed: { expiry: '', identifier: 'userId' },
 }

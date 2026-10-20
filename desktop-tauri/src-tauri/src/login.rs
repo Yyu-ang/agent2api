@@ -669,6 +669,12 @@ fn allowed_hosts(provider: &str) -> Option<&'static [&'static str]> {
         // （落进默认分支会拿到 WorkBuddy 的白名单 → 授权页白屏，日志里什么也
         // 看不出）。
         //
+        // MiniMax Code 两个地区同样不设限：设备授权页在
+        // `account.minimax.cn` / `account.minimax.io`，确认环节可能被
+        // MiniMax 的账号体系继续跳到手机号 / 邮箱验证等不可穷举的主机，
+        // 与 Cline（同为设备流）同一情形。它的完成判定不依赖窗口导航，
+        // 只看后端轮询结果（`providers::minimaxcode::login`）。
+        //
         // Zed 同样不设限：授权页在 `zed.dev`（`native_app_signin`），它按用户
         // 选的登录方式继续跳 GitHub 等不可穷举的身份提供方；回调落在**网关自己**
         // 的本机随机端口（`http://127.0.0.1:<port>`，任意路径，见
@@ -676,7 +682,8 @@ fn allowed_hosts(provider: &str) -> Option<&'static [&'static str]> {
         // 就是上面警告过的那种静默故障。**显式列出**。
         "catpaw" | "qoder" | "qoder-intl" | "cline-free" | "cline-pass" | "autoclaw"
         | "autoclaw-intl" | "accio" | "accio-cn" | "zcode" | "zcode-intl" | "codearts" | "trae"
-        | "kuku" | "antigravity" | "officeace" | "tabbit" | "tabbit-intl" | "orcaterm" | "zed" => None,
+        | "kuku" | "antigravity" | "officeace" | "tabbit" | "tabbit-intl" | "orcaterm"
+        | "minimax-code" | "minimax-code-global" | "zed" => None,
         // WorkBuddy 的两个地区共用这一张表（表里 `workbuddy.ai` 那一行就是国际站
         // 的登录域）。**显式列出**而不是靠下面的默认分支：上面那条警告要求
         // 「新 provider 落到默认分支」必须是有意的选择，写出来才看得出是选过的
@@ -908,6 +915,14 @@ fn normalize_provider(provider: &str) -> Result<&'static str, String> {
         // `orcaterm://oauth_callback?session_id=…` 交回网关换令牌
         // （见 `start_orcaterm` 与 `providers/orcaterm/login.rs` 的模块头）。
         "orcaterm" => Ok("orcaterm"),
+        // MiniMax Code 两个地区：设备授权页由**后端**向账号站拿
+        // （`providers::minimaxcode::login::start`），壳侧只负责开窗口与
+        // 轮询 —— 与 Cline 的设备授权同一条路。授权页**没有任何回调落到
+        // 本机**，结果由后端轮询设备流端点得知；窗口最后停在哪儿都不
+        // 影响登录判定。漏了这一条前端点「网页登录」会直接报「不支持
+        // 网页登录的提供商」。
+        "minimax-code" => Ok("minimax-code"),
+        "minimax-code-global" => Ok("minimax-code-global"),
         // Zed：授权地址由**后端**返回（`native_app_signin`，RSA 公钥与回调
         // 端口由网关进程现造，见 `providers::zed::login`），壳侧只负责开
         // 窗口 —— 与 Trae 同一条链（后端 start → authUrl → 开窗等回调）。

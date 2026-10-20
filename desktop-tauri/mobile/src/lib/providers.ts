@@ -40,6 +40,8 @@ const ICONS: Record<string, string> = {
   officeace: 'assets/providers/officeace.png',
   orcaterm: 'assets/providers/orcaterm.png',
   chatglm: 'assets/providers/chatglm.png',
+  'minimax-code': 'assets/providers/minimax-cn.png',
+  'minimax-code-global': 'assets/providers/minimax.png',
   zed: 'assets/providers/zed.png',
 }
 
@@ -70,6 +72,8 @@ const LABELS: Record<string, string> = {
   officeace: 'OfficeAce 果办',
   orcaterm: 'OrcaTerm',
   chatglm: '智谱清言',
+  'minimax-code': 'MiniMax Code 国内版',
+  'minimax-code-global': 'MiniMax Code 国际版',
   zed: 'Zed',
 }
 
