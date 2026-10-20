@@ -103,6 +103,9 @@ export const PROVIDER_ICONS: Record<string, string> = {
   // （`assets/icon.png`，512×512，与系统里显示的应用图标为同一形象；
   // 归一成 256×256 入库 —— 与 officeace 同一处置）
   chatglm: 'assets/providers/chatglm.png',
+  // Zed：Zed 官方的 GitHub 组织头像（zed-industries，即 zed.dev 编辑器的
+  // 品牌标记，与官网 / 客户端显示的应用图标为同一形象；归一成 256×256 入库）
+  zed: 'assets/providers/zed.png',
 }
 
 /**

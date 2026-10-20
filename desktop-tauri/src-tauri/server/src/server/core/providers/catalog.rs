@@ -212,6 +212,12 @@ pub(crate) fn refresh_meta(kind: ProviderKind) -> (bool, i64) {
             super::chatglm::models::remote_refreshed(),
             super::chatglm::models::last_refreshed_at(),
         ),
+        // Zed 的清单来自远程目录（`GET cloud.zed.dev/models`）；拉不到时
+        // 回落静态兜底 6 个 —— 「有远程内容」才算远程来源（同一口径）。
+        ProviderKind::Zed => (
+            super::zed::models::remote_refreshed(),
+            super::zed::models::last_refreshed_at(),
+        ),
     }
 }
 

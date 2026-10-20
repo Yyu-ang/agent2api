@@ -46,6 +46,8 @@ const FACTS: Record<string, ProviderFacts> = {
   chatglm: { expiry: 'expiresAt', identifier: 'userId' },
   antigravity: { expiry: 'expiresAt', identifier: 'userId' },
   orcaterm: { expiry: 'expiresAt', identifier: 'userId' },
+  // Zed 没有有效期概念：访问令牌不带过期时间（expires=0），被拒才知道失效
+  zed: { expiry: '', identifier: 'userId' },
 }
 
 const FALLBACK: ProviderFacts = { expiry: 'expiresAt', identifier: 'userId' }

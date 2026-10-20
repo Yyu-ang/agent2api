@@ -184,6 +184,12 @@ pub mod tabbit;
 pub mod trae;
 pub mod workbuddy;
 pub mod zcode;
+/// Zed（zed.dev 订阅）：账号管理（native_app_signin 本机监听回调登录 /
+/// 手填凭证校验）+ 模型目录（cloud.zed.dev `/models`）+ **会话式转发**
+/// （`/completions` 包 vendor 原生请求、四家 wire 各自翻译，见
+/// `zed/mod.rs` 的路线取舍）+ 用量（套餐/账期，无已用量）；无续期协议、
+/// 无签到。`is_stateful` 为 true，见 `zed/mod.rs`。
+pub mod zed;
 
 use serde_json::{json, Value};
 
@@ -549,6 +555,12 @@ pub enum ProviderKind {
     /// 智谱清言这一家只有 `chatglm.cn` 一个站点（测试域 `test.chatglm.cn`
     /// 是**环境**不是地区，靠 `CHATGLM_BASE_URL` 覆盖即可）。
     Chatglm,
+    /// Zed（`zed.dev` 的编辑器订阅）。适配实现在 `zed/`：账号管理
+    /// （native_app_signin 本机监听回调登录）+ 模型目录 + 会话式转发
+    /// （cloud.zed.dev 的 `/completions` 包四家 vendor 的原生请求）+
+    /// 用量（套餐/账期）；**没有 refresh token**（令牌被拒即重新登录），
+    /// 也没有签到概念。单一站点（`cloud.zed.dev`），没有地区伴生。
+    Zed,
 }
 
 /// 一个提供商的静态元数据。
@@ -658,6 +670,12 @@ pub const PROVIDERS: &[ProviderMeta] = &[
     // 大面积同名 —— 靠末位让同名模型优先归已有各家（那些是开放平台账号，
     // 配额与稳定性都比本家的消费级网页端好）。
     ProviderMeta { id: "chatglm", label: "智谱清言" },
+    // Zed（zed.dev 订阅）：单一站点（cloud.zed.dev），没有地区伴生。排末尾
+    // （2026-10 接入，后到居后）。它的模型名（claude-sonnet-5 / gpt-5.5 /
+    // gemini-3.5-flash / grok-4.7 等）与各家大面积同名 —— 同名时优先已有
+    // 各家是刻意的：Zed 的额度是编辑器订阅的托管额度，排在开放平台账号
+    // 之后更符合它的定位。
+    ProviderMeta { id: "zed", label: "Zed" },
 ];
 
 /// provider id 在注册表里的下标（未知 id → None）。
@@ -746,6 +764,7 @@ pub fn kind_from_id(id: &str) -> Option<ProviderKind> {
         "tabbit-intl" => Some(ProviderKind::TabbitIntl),
         "orcaterm" => Some(ProviderKind::OrcaTerm),
         "chatglm" => Some(ProviderKind::Chatglm),
+        "zed" => Some(ProviderKind::Zed),
         // 走到这里 = 上面的注册表判定已放行、这个 match 却没有对应分支：
         // 只可能是有人给 `PROVIDERS` 加了条目忘了加这里。开发期喊出来；
         // release 返回 None（见上：宁可为「未知」，不可误认成别家）。
@@ -792,6 +811,7 @@ pub const fn kind_id(kind: ProviderKind) -> &'static str {
         ProviderKind::TabbitIntl => "tabbit-intl",
         ProviderKind::OrcaTerm => "orcaterm",
         ProviderKind::Chatglm => "chatglm",
+        ProviderKind::Zed => "zed",
     }
 }
 

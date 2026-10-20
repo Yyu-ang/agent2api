@@ -250,6 +250,15 @@ const PROVIDER_FEATURES: Record<string, ProviderFeatures> = {
   // `expiry: ''` —— 令牌有效期写在 JWT 的 `exp` 里、由网关自动续期，这一列没有
   //   可显示的事实（与 antigravity / kuku 同一处置），界面不渲染「有效期」。
   chatglm: { usage: true, creditDetail: true, edition: false, identifier: 'uid', expiry: '' },
+  // Zed（zed.dev 订阅）。各位各有出处：
+  // `usage: true` —— 读数是**套餐名 + 账期结束**（`subscription.planName` /
+  //   `subscription.expireAt`，见后端 `providers::zed::balance`）。Zed 不报
+  //   已用量，因此没有 `creditDetail`（没有逐份读数可摊）、没有钱包行。
+  // `edition: false` —— 单一站点（cloud.zed.dev），没有地区/版本之分。
+  // `identifier: 'userId'` —— 身份键就是 Zed 的 user id。
+  // `expiry: ''` —— 访问令牌不带过期时间（被拒才知道失效，且无续期接口），
+  //   这一列没有可显示的事实（与 kuku 同一处置），界面不渲染「有效期」。
+  zed: { usage: true, edition: false, identifier: 'userId', expiry: '' },
 }
 
 /**

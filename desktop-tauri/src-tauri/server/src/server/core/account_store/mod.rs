@@ -131,6 +131,7 @@ pub mod teleagent_accounts;
 pub mod trae_accounts;
 pub mod workbuddy_import;
 pub mod zcode_accounts;
+pub mod zed_accounts;
 
 pub use store::{AccountStore, AccountStoreError};
 

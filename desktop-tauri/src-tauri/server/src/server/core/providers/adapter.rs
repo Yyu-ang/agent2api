@@ -1178,6 +1178,10 @@ pub fn adapter_for(kind: ProviderKind) -> &'static dyn ProviderAdapter {
         // （见 `chatglm/mod.rs` 与 `protocol::chatglm_stream` 的模块头）。
         // 它是本项目**唯一**「访客免登录即可用」的一家（`guest/access` 换证）。
         ProviderKind::Chatglm => &super::chatglm::CHATGLM_ADAPTER,
+        // Zed（zed.dev 订阅）：会话式转发（`is_stateful` 为 true，
+        // `/completions` 包四家 vendor 原生请求、NDJSON 解包在本家内），
+        // 见 `zed/mod.rs` 与 `zed/adapter.rs` 的模块头。
+        ProviderKind::Zed => &super::zed::adapter::ZED_ADAPTER,
     }
 }
 
@@ -1290,6 +1294,10 @@ pub fn implemented_kinds() -> Vec<ProviderKind> {
         // 且有远程目录（`operation/detail?tag=available_models`）—— 必须在
         // 列表里，否则目录刷新循环不会问它（与 Trae / Loomy / Kuku 同一理由）。
         ProviderKind::Chatglm,
+        // Zed：已接真身（登录 / 目录 / 会话式转发 / 用量），且有远程目录
+        // （`GET cloud.zed.dev/models`，`supports_model_refresh()` 为 true）
+        // —— 必须在列表里，否则目录刷新循环不会问它（同一理由）。
+        ProviderKind::Zed,
     ]
 }
 
