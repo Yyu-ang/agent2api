@@ -109,6 +109,11 @@ pub const SCOPE_OFFICEACE: &str = "officeace";
 /// 智谱清言（`chatglm.cn`）的模型目录缓存槽
 pub const SCOPE_CHATGLM: &str = "chatglm";
 
+/// MiniMax Code 国内版的模型目录缓存槽（两地区各一格，清单互不覆盖）
+pub const SCOPE_MINIMAX_CODE: &str = "minimaxCode";
+/// MiniMax Code 国际版的模型目录缓存槽
+pub const SCOPE_MINIMAX_CODE_GLOBAL: &str = "minimaxCodeGlobal";
+
 /// 全部 scope（事实来源：`cached_scopes` 按它遍历；新增一家时加在这里）。
 pub const ALL_SCOPES: &[&str] = &[
     SCOPE_WORKBUDDY,
@@ -131,6 +136,8 @@ pub const ALL_SCOPES: &[&str] = &[
     SCOPE_ANTIGRAVITY,
     SCOPE_OFFICEACE,
     SCOPE_CHATGLM,
+    SCOPE_MINIMAX_CODE,
+    SCOPE_MINIMAX_CODE_GLOBAL,
 ];
 
 /// 一份清单缓存

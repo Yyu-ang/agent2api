@@ -46,6 +46,9 @@ const FACTS: Record<string, ProviderFacts> = {
   chatglm: { expiry: 'expiresAt', identifier: 'userId' },
   antigravity: { expiry: 'expiresAt', identifier: 'userId' },
   orcaterm: { expiry: 'expiresAt', identifier: 'userId' },
+  // MiniMax Code：有效期是 access token 的 expiresAt、标识存 uid（后端落盘口径）
+  'minimax-code': { expiry: 'expiresAt', identifier: 'uid' },
+  'minimax-code-global': { expiry: 'expiresAt', identifier: 'uid' },
 }
 
 const FALLBACK: ProviderFacts = { expiry: 'expiresAt', identifier: 'userId' }

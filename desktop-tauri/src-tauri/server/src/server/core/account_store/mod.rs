@@ -83,6 +83,8 @@
 //!                + 桌面端登录态；§10.2）
 //!   cline_accounts.rs    Cline 账号（两个额度池）：手动添加、桌面端登录态、
 //!                续期回写、Cline 公开形态
+//!   minimaxcode_accounts.rs MiniMax Code 账号（两个地区）：粘贴凭证 / 设备流
+//!                登录落账号、续期回写（比较-再写）、公开形态（uid / email）
 //!   qoder_accounts.rs    Qoder 账号（地区 + userId 识别）：添加、凭证刷新回写、
 //!                Qoder 公开形态
 //!   custom_accounts.rs   自定义提供商账号（`custom-` 前缀的 provider）：手动
@@ -110,6 +112,7 @@ pub mod commandcode_accounts;
 pub mod custom_accounts;
 pub mod kuku_accounts;
 pub mod loomy_accounts;
+pub mod minimaxcode_accounts;
 pub mod monkeycode_accounts;
 pub mod officeace_accounts;
 pub mod orcaterm_accounts;
@@ -254,6 +257,28 @@ pub(crate) const CLINE_PASS_PROVIDER_ID: &str = crate::server::core::providers::
 /// 是个不会报错的静默失配，所以这里给出唯一的判据函数。
 pub(crate) fn is_cline_family(provider_id: &str) -> bool {
     provider_id == CLINE_FREE_PROVIDER_ID || provider_id == CLINE_PASS_PROVIDER_ID
+}
+
+/// MiniMax Code **国内版** provider id（**从注册表推导**，同
+/// [`CLINE_FREE_PROVIDER_ID`] 的口径）。账号形态见 `minimaxcode_accounts.rs`。
+pub(crate) const MINIMAX_CODE_PROVIDER_ID: &str = crate::server::core::providers::kind_id(
+    crate::server::core::providers::ProviderKind::MinimaxCode,
+);
+
+/// MiniMax Code **国际版** provider id（同 [`MINIMAX_CODE_PROVIDER_ID`] 的口径）
+pub(crate) const MINIMAX_CODE_GLOBAL_PROVIDER_ID: &str =
+    crate::server::core::providers::kind_id(
+        crate::server::core::providers::ProviderKind::MinimaxCodeGlobal,
+    );
+
+/// 这个 provider 是不是 **MiniMax Code 系**（两个地区之一）。
+///
+/// 与 [`is_cline_family`] 同一形态、同一理由：账号层几处判断只关心
+/// 「是不是 MiniMax Code」（公开形态、续期回写、身份字段落在 `uid` 上），
+/// 不关心哪个地区 —— 那些分支全走本函数，避免散落的 id 字面量比对
+/// 对其中一个地区恒为假的静默失配。
+pub(crate) fn is_minimaxcode_family(provider_id: &str) -> bool {
+    provider_id == MINIMAX_CODE_PROVIDER_ID || provider_id == MINIMAX_CODE_GLOBAL_PROVIDER_ID
 }
 
 /// 这个 provider 是不是 **AutoClaw 系**（两个地区之一）。

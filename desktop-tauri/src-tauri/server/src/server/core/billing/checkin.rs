@@ -95,6 +95,13 @@ pub fn supports_checkin(account: &Value) -> bool {
     if provider == crate::server::core::providers::qoder::endpoints::Region::Global.provider_id() {
         return true;
     }
+    // MiniMax Code 两个地区都有每日签到（签名 signin 面板，见
+    // `providers::minimaxcode::checkin`）。本家账号记录不写 edition，
+    // 本来不会被下面的 intl 一刀切误伤；显式放行写在这里是为了让判据
+    // 自明——将来记录形态变化时不用再回来查这一刀切的边界。
+    if crate::server::core::account_store::is_minimaxcode_family(provider) {
+        return true;
+    }
     if account.get("edition").and_then(Value::as_str) == Some("intl") {
         return false;
     }
@@ -387,6 +394,23 @@ pub async fn checkin_for(
             .await
             .map_err(|error| error.message)
             .map(welfare_claim_of);
+            claim_result(id, name, &display, true, claim)
+        }
+        "minimax-code" | "minimax-code-global" => {
+            // MiniMax Code：每日签到积分。两个地区的面板与签名站点各自
+            // 独立（地区由 provider id 反查，不看账号字段——地区是身份
+            // 不是属性）。实现的口径：7 天面板校验、只有 status 2 才
+            // claim、已签到给 alreadyCompleted（见
+            // `providers::minimaxcode::checkin` 的模块头）。
+            let region = crate::server::core::providers::minimaxcode::region::Region::from_provider_id(
+                provider_id,
+            )
+            .unwrap_or(crate::server::core::providers::minimaxcode::region::Region::Cn);
+            let claim = crate::server::core::providers::minimaxcode::checkin::claim_daily_checkin(
+                store, region, &id,
+            )
+            .await
+            .map_err(|error| error.message);
             claim_result(id, name, &display, true, claim)
         }
         "chatglm" => {

@@ -724,6 +724,95 @@ impl LoginService {
         Ok(handle)
     }
 
+    /// 发起一个 **MiniMax Code 设备授权登录**（两个地区共用，地区由
+    /// `provider` 反查）。
+    ///
+    /// ── 为什么与 Cline 那条是同形（而不是新开一套机制）──────────────
+    /// 两家的登录都是 RFC 8628 设备流：先拿 user_code 与授权页 → 壳侧 /
+    /// 系统浏览器打开 → 后端轮询换令牌 → 落账号。本家的差异全在协议
+    /// 层（PKCE、按 user_code 轮询的变体、毫秒 interval，见
+    /// `providers::minimaxcode::login` 的模块头），分发机制一字不差地
+    /// 复用：任务表、句柄、`/wait` 语义、取消（删任务即停）都现成。
+    ///
+    /// `state` 用 user_code 拼：设备流变体下 device_code 可能根本不存在，
+    /// user_code 是两形态都有的那一个（且它本来就是给用户看的码，不敏感）。
+    pub async fn start_minimaxcode_device_login(
+        &self,
+        provider: &str,
+        name: Option<String>,
+    ) -> Result<LoginTaskHandle, String> {
+        let label = crate::server::core::providers::label_of(provider);
+        let region = crate::server::core::providers::minimaxcode::region::Region::from_provider_id(
+            provider,
+        )
+        .ok_or_else(|| format!("{provider} 不是 MiniMax Code 系的提供商"))?;
+        // 第一步同步等待（一次 POST）：它决定 authUrl，拿不到就没有页面可开
+        let start = crate::server::core::providers::minimaxcode::login::start(region)
+            .await
+            .map_err(|error| error.message)?;
+        let state = format!(
+            "minimax-{}",
+            crate::server::core::account_store::store_util::truncate_text(&start.user_code, 12)
+        );
+        let auth_url = start.verification_uri.clone();
+        let info = resolve_edition(Some(DEFAULT_EDITION));
+        let handle = self.new_handle_for_provider(info, provider);
+        handle.update(|task| {
+            task.state = Some(state.clone());
+            task.auth_url = Some(auth_url.clone());
+        });
+        self.tasks.register(&state, handle.clone());
+        logging::log(
+            "[Login]",
+            &format!("发起{label}设备授权登录（授权码 {}）", start.user_code),
+        );
+        // 后台轮询：用户确认后换令牌、落账号、写回句柄
+        let service = self.clone();
+        let task_state = state.clone();
+        let task_provider = provider.to_string();
+        tokio::spawn(async move {
+            let store = service.store.clone();
+            let result = crate::server::core::providers::minimaxcode::login::poll_and_register(
+                &store,
+                region,
+                &start,
+                name.as_deref(),
+            )
+            .await;
+            let Some(handle) = service.tasks.get(&task_state) else {
+                // 任务已被 cancel / 过期回收：账号已经落地，这里只记一条日志
+                logging::verbose(
+                    "[Login]",
+                    "MiniMax Code 登录任务已不在表中，结果未写回（账号仍已保存）",
+                );
+                return;
+            };
+            match result {
+                Ok(account_id) => {
+                    let nickname = store
+                        .minimaxcode_account_record(&task_provider, &account_id)
+                        .and_then(|record| {
+                            record
+                                .get("email")
+                                .and_then(Value::as_str)
+                                .map(str::to_string)
+                        })
+                        .unwrap_or_default();
+                    // 复用 workbuddy 那条链路的会话摘要形状，前端不需要新分支
+                    finish_task(
+                        &handle,
+                        &json!({
+                            "account": { "uid": account_id, "nickname": nickname },
+                            "edition": "",
+                        }),
+                    );
+                }
+                Err(error) => finish_task_error(&handle, &error.message),
+            }
+        });
+        Ok(handle)
+    }
+
     /// 等 authUrl（对应 Node 版 `/api/session/login/start` 的 15 秒等待）。
     ///
     /// 返回 `(state, authUrl, edition)`；超时或任务提前失败时返回错误原因。
