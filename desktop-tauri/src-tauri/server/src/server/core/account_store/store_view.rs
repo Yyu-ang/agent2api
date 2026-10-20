@@ -388,6 +388,10 @@ impl AccountStore {
             // TeleAgent：只透出标识与 key 尾号（key 本体不出这个函数）。
             // 漏这一支会掉进 workbuddy 兜底形状，界面多出一批与它无关的空字段。
             self.to_teleagent_public_account(record)
+        } else if record.provider() == super::zed_accounts::ZED_PROVIDER_ID {
+            // Zed（zed.dev 订阅）：单一站点、没有地区伴生，公开形态带
+            // userId / planName / organizationId（见 `zed_accounts.rs`）
+            self.to_zed_public_account(record)
         } else if record.provider() == super::orcaterm_accounts::ORCATERM_PROVIDER_ID {
             // OrcaTerm（腾讯云遨驰终端桌面客户端）：单一入口（粘贴 accessToken /
             // 导入桌面端登录态），公开形态带 uid(=userId) / loginName(=昵称) /

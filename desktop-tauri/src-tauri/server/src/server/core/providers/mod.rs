@@ -189,6 +189,12 @@ pub mod tabbit;
 pub mod trae;
 pub mod workbuddy;
 pub mod zcode;
+/// Zed（zed.dev 订阅）：账号管理（native_app_signin 本机监听回调登录 /
+/// 手填凭证校验）+ 模型目录（cloud.zed.dev `/models`）+ **会话式转发**
+/// （`/completions` 包 vendor 原生请求、四家 wire 各自翻译，见
+/// `zed/mod.rs` 的路线取舍）+ 用量（套餐/账期，无已用量）；无续期协议、
+/// 无签到。`is_stateful` 为 true，见 `zed/mod.rs`。
+pub mod zed;
 
 use serde_json::{json, Value};
 
@@ -566,6 +572,12 @@ pub enum ProviderKind {
     /// 地区 ↔ 站点的互查在 `minimaxcode::region::Region`，不要在别处写
     /// `"minimax-code-global"` 这类字面量。
     MinimaxCodeGlobal,
+    /// Zed（`zed.dev` 的编辑器订阅）。适配实现在 `zed/`：账号管理
+    /// （native_app_signin 本机监听回调登录）+ 模型目录 + 会话式转发
+    /// （cloud.zed.dev 的 `/completions` 包四家 vendor 的原生请求）+
+    /// 用量（套餐/账期）；**没有 refresh token**（令牌被拒即重新登录），
+    /// 也没有签到概念。单一站点（`cloud.zed.dev`），没有地区伴生。
+    Zed,
 }
 
 /// 一个提供商的静态元数据。
@@ -680,6 +692,12 @@ pub const PROVIDERS: &[ProviderMeta] = &[
     // 靠末位让同名模型优先归已有各家。
     ProviderMeta { id: "minimax-code", label: "MiniMax Code 国内版" },
     ProviderMeta { id: "minimax-code-global", label: "MiniMax Code 国际版" },
+    // Zed（zed.dev 订阅）：单一站点（cloud.zed.dev），没有地区伴生。排末尾
+    // （2026-10 接入，后到居后）。它的模型名（claude-sonnet-5 / gpt-5.5 /
+    // gemini-3.5-flash / grok-4.7 等）与各家大面积同名 —— 同名时优先已有
+    // 各家是刻意的：Zed 的额度是编辑器订阅的托管额度，排在开放平台账号
+    // 之后更符合它的定位。
+    ProviderMeta { id: "zed", label: "Zed" },
 ];
 
 /// provider id 在注册表里的下标（未知 id → None）。
@@ -770,6 +788,7 @@ pub fn kind_from_id(id: &str) -> Option<ProviderKind> {
         "chatglm" => Some(ProviderKind::Chatglm),
         "minimax-code" => Some(ProviderKind::MinimaxCode),
         "minimax-code-global" => Some(ProviderKind::MinimaxCodeGlobal),
+        "zed" => Some(ProviderKind::Zed),
         // 走到这里 = 上面的注册表判定已放行、这个 match 却没有对应分支：
         // 只可能是有人给 `PROVIDERS` 加了条目忘了加这里。开发期喊出来；
         // release 返回 None（见上：宁可为「未知」，不可误认成别家）。
@@ -818,6 +837,7 @@ pub const fn kind_id(kind: ProviderKind) -> &'static str {
         ProviderKind::Chatglm => "chatglm",
         ProviderKind::MinimaxCode => "minimax-code",
         ProviderKind::MinimaxCodeGlobal => "minimax-code-global",
+        ProviderKind::Zed => "zed",
     }
 }
 

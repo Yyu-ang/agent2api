@@ -107,6 +107,9 @@ export const PROVIDER_ICONS: Record<string, string> = {
   // MiniMax 资产同源；两地是两个客户端形态，各用一张）
   'minimax-code': 'assets/providers/minimax-cn.png',
   'minimax-code-global': 'assets/providers/minimax.png',
+  // Zed：Zed 官方的 GitHub 组织头像（zed-industries，即 zed.dev 编辑器的
+  // 品牌标记，与官网 / 客户端显示的应用图标为同一形象；归一成 256×256 入库）
+  zed: 'assets/providers/zed.png',
 }
 
 /**

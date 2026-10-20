@@ -1382,6 +1382,75 @@ pub async fn add_account(state: &ServerState, body: &Bytes) -> Response {
                 },
             )
         }
+        // Zed：**粘贴凭证**（accessToken + userId，systemId 可选）→ 手动添加；
+        // 「网页登录」是另一条链路（`api::session::login_start` 的 Zed 分支 →
+        // `core::login::zed` 的本机监听任务 → 同一个落账号入口
+        // `add_zed_account`）。
+        //
+        // ── 为什么添加时要真打一次 users/me ──────────────────
+        // 组织与套餐不在粘贴材料里（它们由登录流程从 users/me 读出后存进
+        // 状态 JSON），手填路径若不读一次，落下的就是一条「组织为空」的
+        // 半成品账号（铸造令牌时 organization_id 为空，转发必然失败且
+        // 原因难查）。照 chatglm 的处置：添加即校验 —— 顺带把展示名与
+        // 套餐一并读实，读不通就如实 400/上游状态，不落半成品。
+        // systemId 留空时现生成一个：它是「这台设备」的标识，手填材料
+        // 往往来自另一台机器上的一次登录，沿用那边的 systemId 不如新造
+        // （与登录流程每轮新造同一个口径）。
+        Some(crate::server::core::providers::ProviderKind::Zed) => {
+            use crate::server::core::providers::zed::credentials::{
+                credential_from_me, new_system_id, Credential as ZedCredential,
+            };
+            let text_of = |key: &str| {
+                payload
+                    .get(key)
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .trim()
+                    .to_string()
+            };
+            let access = text_of("accessToken");
+            let user_id = text_of("userId");
+            if access.is_empty() || user_id.is_empty() {
+                Err(AccountStoreError::bad_request(
+                    "Zed 账号需要 accessToken 与 userId 两项（从一次网页登录的账号里导出，或直接用上方「网页登录」）",
+                ))
+            } else {
+                let system_id = {
+                    let given = text_of("systemId");
+                    if given.is_empty() {
+                        new_system_id().unwrap_or_default()
+                    } else {
+                        given
+                    }
+                };
+                let probe = ZedCredential {
+                    access: access.clone(),
+                    user_id: user_id.clone(),
+                    system_id: system_id.clone(),
+                    org: String::new(),
+                    plan: String::new(),
+                    login: String::new(),
+                    name: String::new(),
+                    display: String::new(),
+                };
+                match crate::server::core::providers::zed::http::users_me(
+                    &probe,
+                    None,
+                    std::time::Duration::from_secs(15),
+                )
+                .await
+                {
+                    Ok(me) => match credential_from_me(&access, &user_id, &system_id, &me) {
+                        Ok(credential) => store.add_zed_account(&credential, import_name, "manual"),
+                        Err(message) => Err(AccountStoreError::bad_request(message)),
+                    },
+                    Err(error) => Err(AccountStoreError::new(
+                        format!("Zed 凭证校验失败：{}", error.message()),
+                        i32::from(error.status().unwrap_or(502)),
+                    )),
+                }
+            }
+        }
         // WorkBuddy 系的两家（国内版 / 国际版）：同一套凭证形态与落账号路径，
         // 差别只有归属 —— provider id 自己就是归属（拆家后不再从 payload 里的
         // `edition` 反推：那是账号的属性，而落哪一家是身份问题）。
@@ -1754,6 +1823,17 @@ pub async fn refresh_account(state: &ServerState, body: &Bytes) -> Response {
             400,
             "Command Code 的 API Key 没有刷新机制（静态 key、上游无续期接口）：\
              请在 commandcode.ai/studio 重新获取后在本页重新粘贴",
+        );
+    }
+    // Zed：同样**没有刷新机制**（Zed 不发 refresh token，访问令牌被拒即
+    // 登录过期，见 `providers::zed` 的模块头）。不显式拦下的话会落到下面的
+    // workbuddy 兜底链路，用户会收到一条与腾讯鉴权端点相关的错误 —— 与
+    // CatPaw / MonkeyCode / Command Code 漏登记时的症状同一性质。
+    if state.store().zed_account_record(&id).is_some() {
+        return management_error(
+            400,
+            "Zed 登录态没有刷新机制（无 refresh token）：令牌失效后请在本页\
+             重新用「网页登录」登录，或重新粘贴新的访问令牌",
         );
     }
     // Antigravity：**有**可刷新的 refreshToken（Google OAuth），走自家适配器的

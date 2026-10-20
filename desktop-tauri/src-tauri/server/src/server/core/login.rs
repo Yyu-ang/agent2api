@@ -35,6 +35,7 @@ mod qoder;
 mod officeace;
 mod trae;
 mod zcode;
+mod zed;
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -275,6 +276,12 @@ pub struct LoginService {
     /// 也不该让别的 provider 每次轮询都陪着带一份别人用不到的东西。
     /// 表里同一时刻最多一条（见 `login/trae.rs` 模块头）。
     trae_login: Arc<Mutex<HashMap<String, Arc<crate::server::core::providers::trae::login::Session>>>>,
+    /// Zed 网页登录的额外状态（`state → 进行中的一轮`）。
+    ///
+    /// 单独一张表的理由与 [`Self::trae_login`] 相同：它的值是**活对象**
+    /// （持有 RSA 私钥与本机回调监听器），不能塞进共用的任务状态。
+    /// 表里同一时刻最多一条（见 `login/zed.rs` 模块头）。
+    zed_login: Arc<Mutex<HashMap<String, Arc<crate::server::core::providers::zed::login::Session>>>>,
 }
 
 impl LoginService {
@@ -285,6 +292,7 @@ impl LoginService {
             tasks: LoginTasks::new(),
             autoclaw_oauth: Arc::new(Mutex::new(HashMap::new())),
             trae_login: Arc::new(Mutex::new(HashMap::new())),
+            zed_login: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -295,6 +303,11 @@ impl LoginService {
     /// Trae 登录的待办表（`login/trae.rs` 用它挂这一轮的回调监听器）。
     pub(crate) fn trae_login(&self) -> &Arc<Mutex<HashMap<String, Arc<crate::server::core::providers::trae::login::Session>>>> {
         &self.trae_login
+    }
+
+    /// Zed 登录的待办表（`login/zed.rs` 用它挂这一轮的私钥与回调监听器）。
+    pub(crate) fn zed_login(&self) -> &Arc<Mutex<HashMap<String, Arc<crate::server::core::providers::zed::login::Session>>>> {
+        &self.zed_login
     }
 
     /// 取消一次登录：任务表那一步见 [`LoginTasks::cancel`]，这里多做的事是
@@ -325,6 +338,10 @@ impl LoginService {
             // 与 AutoClaw 那次「取消后立刻重试抢不到端口」是同一个坑。
             if state.starts_with("trae-") {
                 self.close_trae_login();
+            }
+            // Zed 同理：取消必须显式收摊还端口（理由同 Trae 那条）
+            if state.starts_with("zed-") {
+                self.close_zed_login();
             }
         }
         canceled

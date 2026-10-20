@@ -42,6 +42,7 @@ const ICONS: Record<string, string> = {
   chatglm: 'assets/providers/chatglm.png',
   'minimax-code': 'assets/providers/minimax-cn.png',
   'minimax-code-global': 'assets/providers/minimax.png',
+  zed: 'assets/providers/zed.png',
 }
 
 /** 后端没给 label 时的兜底展示名（认不出的 id 原样显示） */
@@ -73,6 +74,7 @@ const LABELS: Record<string, string> = {
   chatglm: '智谱清言',
   'minimax-code': 'MiniMax Code 国内版',
   'minimax-code-global': 'MiniMax Code 国际版',
+  zed: 'Zed',
 }
 
 /** 图标地址；认不出的 id 返回空串（调用方画首字徽章） */

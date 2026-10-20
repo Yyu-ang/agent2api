@@ -981,6 +981,54 @@ const CHATGLM: ProviderConfig = {
   ],
 }
 
+/**
+ * Zed（zed.dev 编辑器订阅）。
+ *
+ * ── 登录形态 ────────────────────────────────────────────────
+ * 网页登录走 Zed 的 `native_app_signin`：网关在本机起一个随机端口的临时
+ * 监听，授权页在浏览器里登录后把浏览器送回那个端口完成登录 —— 与 Trae
+ * 同一条「回调落本机」路线，因此同机部署是前提，Docker / 远程面板收不到
+ * 回调时用下方粘贴凭证。Zed **没有 refresh token**：访问令牌被拒就必须
+ * 重新登录，这里不给任何「续期」入口（与 Loomy 同一处置）。
+ *
+ * ── 粘贴凭证要填什么 ────────────────────────────────────────
+ * accessToken 与 userId 必填；systemId 是登录时那台「设备」的标识 —— 从
+ * 另一台机器抄来的凭证可以不填，网关会新造一个并据此向 Zed 读回账号
+ * （组织与套餐由网关读 `cloud.zed.dev` 的账号信息得出，不用用户填）。
+ */
+const ZED: ProviderConfig = {
+  provider: 'zed',
+  label: 'Zed',
+  // Zed 桌面端的登录态没有稳定可读的文件形态（登录靠一次性 RSA 回调），
+  // 不提供「导入桌面端登录态」。
+  desktop: false,
+  webLogin: {
+    noteHtml: t('打开 <b>Zed</b> 的官方授权页（<code>zed.dev</code>）并用你的 Zed 账号登录：授权完成后官方页面会跳回<b>本机</b>的一个临时端口完成登录；同机部署自动接收。Docker / 远程部署收不到本机回调，请改用下方「填写凭证」。'),
+    button: t('打开 Zed 授权页'),
+    busyText: t('等待 Zed 授权完成…'),
+    modes: [
+      {
+        value: 'embedded',
+        label: t('内嵌窗口（推荐）'),
+        hint: t('将打开内嵌窗口；授权完成后自动加入账号列表。关掉窗口即取消等待。链接 5 分钟内有效，超时或未点就会作废（可重新发起）'),
+      },
+      {
+        value: 'external',
+        label: t('系统浏览器'),
+        hint: t('将用系统默认浏览器打开授权页（会复用浏览器里已登录的 Zed 账号）；同机完成后自动加入账号列表。'),
+      },
+    ],
+  },
+  manualTitle: t('填写凭证'),
+  manualNoteHtml: t('Zed 的访问令牌来自一次完成的网页登录（没有 refresh token，令牌被拒后只能重新登录）。<b>accessToken</b> 与 <b>userId</b> 必填；<b>systemId</b> 是那次登录的设备标识，从别处抄来的凭证可以留空 —— 网关会新造一个，并向 <code>cloud.zed.dev</code> 读回账号核对（组织与套餐不用填，读回时自动得出）。添加时网关会真校验一次：令牌无效或账号组织关掉了 Zed 托管模型都会当场报错，不会落下一条半成品账号。'),
+  fields: [
+    { key: 'accessToken', label: 'accessToken', rows: 3, placeholder: t('Zed 的访问令牌（一长串）') },
+    { key: 'userId', label: 'userId', placeholder: t('Zed 的用户 ID（纯数字串）') },
+    { key: 'systemId', label: 'systemId', optional: true, placeholder: t('可选；UUID 形态，留空由网关新造') },
+    { key: 'name', label: t('备注名'), optional: true, placeholder: t('可选，留空自动用账号名') },
+  ],
+}
+
 /** 内置家的表单块，顺序与旧 ADD_FORMS 一致（只影响 DOM 里的块顺序，不影响界面） */
 export const BUILTIN_CONFIGS: ProviderConfig[] = [
   RACCOON,
@@ -1039,6 +1087,9 @@ export const BUILTIN_CONFIGS: ProviderConfig[] = [
   // 注册表 PROVIDERS 的追加顺序一致（2026-10 接入）。设备流登录 + 粘贴凭证。
   minimaxCodeForm({ provider: 'minimax-code', label: 'MiniMax Code 国内版', site: 'account.minimax.cn' }),
   minimaxCodeForm({ provider: 'minimax-code-global', label: 'MiniMax Code 国际版', site: 'account.minimax.io' }),
+  // Zed（zed.dev 订阅）：网页登录（本机回调）/ 粘贴凭证，排在末尾
+  // （与后端注册表 PROVIDERS 的排列一致，2026-10 接入）
+  ZED,
 ]
 
 /** WorkBuddy 的块 id（结构特殊，单独一个组件） */

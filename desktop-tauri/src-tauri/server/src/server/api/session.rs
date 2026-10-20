@@ -292,6 +292,30 @@ pub async fn login_start(State(state): State<ServerState>, body: Bytes) -> Respo
         return ok_json(json!({ "state": task_state, "authUrl": auth_url,
             "edition": task_edition, "provider": "trae" }));
     }
+    // Zed：**网页登录 + 本机回调监听**（native_app_signin；RSA 密钥与监听
+    // 端口由本进程现造，见 `core::login::zed`）。响应形状与 Trae 那条一致
+    // （`{state, authUrl, edition, provider}`），前端不需要新分支。等待上限
+    // 用通用值即可：地址是本地拼装（密钥生成 + 绑端口，百毫秒量级），不像
+    // Trae 那样要先问一次上游 guidance。
+    if kind == crate::server::core::providers::ProviderKind::Zed {
+        let handle = match state.login().start_zed_login() {
+            Ok(handle) => handle,
+            Err(error) => return management_error(400, error),
+        };
+        let (task_state, auth_url, task_edition) = match state
+            .login()
+            .wait_for_auth_url(&handle, Duration::from_millis(AUTH_URL_WAIT_MS))
+            .await
+        {
+            Ok(values) => values,
+            Err(error) => {
+                logging::log("[Login]", &format!("❌ 发起 Zed 登录失败: {error}"));
+                return management_error(502, error);
+            }
+        };
+        return ok_json(json!({ "state": task_state, "authUrl": auth_url,
+            "edition": task_edition, "provider": "zed" }));
+    }
     // OfficeAce（华为云果办 / OfficeClaw）：**服务端中介的轮询登录**（与 ZCode
     // 同一形态，见 `core::login::officeace` 的模块头）—— 授权地址由本进程现造
     // （先向云端要 state），用户在浏览器里登完，后台任务**轮询云端**取授权码，
